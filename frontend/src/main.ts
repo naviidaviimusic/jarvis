@@ -112,16 +112,20 @@ socket.onMessage((msg) => {
     const audioData = msg.data as string;
     console.log("[audio] received", audioData ? `${audioData.length} chars` : "EMPTY", "state:", currentState);
     if (audioData) {
+      if (!started) {
+        // Queue until user clicks
+        pendingAudio.push({ data: audioData, text: msg.text || "" });
+        return;
+      }
       if (currentState !== "speaking") {
         transition("speaking");
       }
       audioPlayer.enqueue(audioData);
     } else {
-      // TTS failed — no audio but still need to return to idle
+      // TTS failed — return to idle
       console.warn("[audio] no data received, returning to idle");
       transition("idle");
     }
-    // Log text for debugging
     if (msg.text) console.log("[JARVIS]", msg.text);
   } else if (type === "status") {
     const state = msg.state as string;
@@ -145,28 +149,52 @@ socket.onMessage((msg) => {
 });
 
 // ---------------------------------------------------------------------------
-// Kick off
+// Kick off — require user click to unlock AudioContext (browser policy)
 // ---------------------------------------------------------------------------
 
-// Start listening after a brief delay for the orb to render
-setTimeout(() => {
-  voiceInput.start();
-  transition("listening");
-}, 1000);
+const startOverlay = document.getElementById("start-overlay")!;
+let started = false;
+const pendingAudio: Array<{ data: string; text: string }> = [];
 
-// Resume AudioContext on ANY user interaction (browser autoplay policy)
-function ensureAudioContext() {
+function startJarvis() {
+  if (started) return;
+  started = true;
+
+  // Unlock AudioContext — must happen inside a user gesture
   const ctx = audioPlayer.getAnalyser().context as AudioContext;
-  if (ctx.state === "suspended") {
-    ctx.resume().then(() => console.log("[audio] context resumed"));
-  }
-}
-document.addEventListener("click", ensureAudioContext);
-document.addEventListener("touchstart", ensureAudioContext);
-document.addEventListener("keydown", ensureAudioContext, { once: true });
+  ctx.resume().then(() => {
+    console.log("[audio] context unlocked");
+    for (const item of pendingAudio) {
+      if (currentState !== "speaking") transition("speaking");
+      audioPlayer.enqueue(item.data);
+      if (item.text) console.log("[JARVIS]", item.text);
+    }
+    pendingAudio.length = 0;
+  });
 
-// Try to resume audio context on load
-ensureAudioContext();
+  // Explicitly request microphone permission — forces Chrome permission dialog
+  navigator.mediaDevices.getUserMedia({ audio: true })
+    .then((stream) => {
+      // Permission granted — stop the stream (speech recognition manages its own)
+      stream.getTracks().forEach(t => t.stop());
+      console.log("[mic] permission granted");
+      voiceInput.start();
+      transition("listening");
+    })
+    .catch((err) => {
+      console.error("[mic] permission denied:", err);
+      showError("Microphone access denied — please allow in Chrome settings.");
+      // Still try speech recognition, it may prompt again
+      voiceInput.start();
+      transition("listening");
+    });
+
+  startOverlay.classList.add("hidden");
+  setTimeout(() => { startOverlay.style.display = "none"; }, 700);
+}
+
+startOverlay.addEventListener("click", startJarvis, { once: true });
+startOverlay.addEventListener("touchstart", startJarvis, { once: true });
 
 // ---------------------------------------------------------------------------
 // UI Controls

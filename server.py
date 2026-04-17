@@ -56,6 +56,11 @@ from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("jarvis")
 
+# Local Whisper STT — bypasses Chrome Web Speech API / Google servers entirely
+from stt import MicListener
+_mic_listener: MicListener = None  # started in lifespan
+_transcript_queue: asyncio.Queue = asyncio.Queue()  # mic → voice handler
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -1046,33 +1051,39 @@ _last_greeting_time: float = 0
 # TTS (Fish Audio)
 # ---------------------------------------------------------------------------
 
-async def synthesize_speech(text: str) -> Optional[bytes]:
-    """Generate speech audio from text using Fish Audio TTS."""
-    if not FISH_API_KEY:
-        log.warning("FISH_API_KEY not set, skipping TTS")
-        return None
+_tts_cache: dict[str, bytes] = {}
 
+async def _resume_mic_after(delay: float):
+    """Resume mic listener after JARVIS finishes speaking."""
+    await asyncio.sleep(delay)
+    if _mic_listener:
+        _mic_listener.resume()
+
+
+async def synthesize_speech(text: str) -> Optional[bytes]:
+    """Generate speech audio from text using Edge TTS (British JARVIS voice)."""
+    if not text or not text.strip():
+        return None
+    # Truncate very long responses for speed — speak first 400 chars
+    text = text.strip()[:400]
+    if text in _tts_cache:
+        return _tts_cache[text]
     try:
-        async with httpx.AsyncClient(timeout=15.0) as http:
-            response = await http.post(
-                FISH_API_URL,
-                headers={
-                    "Authorization": f"Bearer {FISH_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "text": text,
-                    "reference_id": FISH_VOICE_ID,
-                    "format": "mp3",
-                },
-            )
-            if response.status_code == 200:
-                _session_tokens["tts_calls"] += 1
-                _append_usage_entry(0, 0, "tts")
-                return response.content
-            else:
-                log.error(f"TTS error: {response.status_code}")
-                return None
+        import edge_tts, io
+        communicate = edge_tts.Communicate(text, voice="en-GB-RyanNeural", rate="+10%")
+        buf = io.BytesIO()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                buf.write(chunk["data"])
+        audio = buf.getvalue()
+        if audio:
+            # Cache short phrases to avoid repeat TTS calls
+            if len(text) < 120:
+                _tts_cache[text] = audio
+            _session_tokens["tts_calls"] += 1
+            _append_usage_entry(0, 0, "tts")
+            return audio
+        return None
     except Exception as e:
         log.error(f"TTS error: {e}")
         return None
@@ -1336,7 +1347,7 @@ return windowList
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global anthropic_client, cached_projects
+    global anthropic_client, cached_projects, _mic_listener
     if ANTHROPIC_API_KEY:
         anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
     else:
@@ -1345,9 +1356,20 @@ async def lifespan(application: FastAPI):
 
     # Start context refresh in a separate thread (never touches event loop)
     _refresh_context_sync()
-    log.info("JARVIS server starting")
 
+    # Start local Whisper mic listener — pushes transcripts into queue for voice handler
+    def _on_transcript(text: str):
+        loop = asyncio.get_event_loop()
+        asyncio.run_coroutine_threadsafe(_transcript_queue.put(text), loop)
+
+    _mic_listener = MicListener(on_transcript=_on_transcript)
+    _mic_listener.start(asyncio.get_event_loop())
+
+    log.info("JARVIS server starting")
     yield
+
+    if _mic_listener:
+        _mic_listener.stop()
 
 
 app = FastAPI(title="JARVIS Server", version="0.1.0", lifespan=lifespan)
@@ -1620,7 +1642,7 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
             try:
                 await ws.send_json({"type": "status", "state": "speaking"})
                 if audio:
-                    await ws.send_json({"type": "audio", "data": audio, "text": result_text})
+                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": result_text})
                 else:
                     await ws.send_json({"type": "text", "text": result_text})
                 await ws.send_json({"type": "status", "state": "idle"})
@@ -1640,7 +1662,7 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
             audio = await synthesize_speech(fallback)
             await ws.send_json({"type": "status", "state": "speaking"})
             if audio:
-                await ws.send_json({"type": "audio", "data": audio, "text": fallback})
+                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": fallback})
             await ws.send_json({"type": "status", "state": "idle"})
         except Exception:
             pass
@@ -1915,6 +1937,7 @@ async def voice_handler(ws: WebSocket):
 
             async def _send_greeting():
                 try:
+                    await asyncio.sleep(0.5)  # Wait for WS to fully establish
                     audio_bytes = await synthesize_speech(greeting)
                     if audio_bytes:
                         encoded = base64.b64encode(audio_bytes).decode()
@@ -1934,11 +1957,24 @@ async def voice_handler(ws: WebSocket):
             return  # WebSocket already gone
 
         while True:
-            raw = await ws.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
+            # Listen to both browser WebSocket AND local mic queue simultaneously
+            ws_task  = asyncio.create_task(ws.receive_text())
+            mic_task = asyncio.create_task(_transcript_queue.get())
+            done, pending = await asyncio.wait(
+                {ws_task, mic_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+
+            if mic_task in done:
+                transcript_text = mic_task.result()
+                msg = {"type": "transcript", "text": transcript_text, "isFinal": True}
+            else:
+                raw = ws_task.result()
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
 
             # ── Fix-self: activate work mode in JARVIS repo ──
             if msg.get("type") == "fix_self":
@@ -1949,7 +1985,7 @@ async def voice_handler(ws: WebSocket):
                 await ws.send_json({"type": "status", "state": "speaking"})
                 audio = await synthesize_speech(tts)
                 if audio:
-                    await ws.send_json({"type": "audio", "data": audio, "text": response_text})
+                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
                 else:
                     await ws.send_json({"type": "text", "text": response_text})
                 continue
@@ -2318,15 +2354,20 @@ async def voice_handler(ws: WebSocket):
                 if anthropic_client and len(user_text) > 15:
                     asyncio.create_task(extract_memories(user_text, response_text, anthropic_client))
 
-                # TTS
+                # TTS — pause mic so JARVIS doesn't hear itself
                 tts = strip_markdown_for_tts(response_text)
+                if _mic_listener: _mic_listener.pause()
                 await ws.send_json({"type": "status", "state": "speaking"})
                 audio = await synthesize_speech(tts)
                 if audio:
                     await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
+                    # Resume mic after estimated audio duration + 0.5s buffer
+                    audio_duration = len(audio) / (16000 * 2)  # approx bytes to seconds
+                    asyncio.create_task(_resume_mic_after(audio_duration + 0.5))
                 else:
                     await ws.send_json({"type": "text", "text": response_text})
                     await ws.send_json({"type": "status", "state": "idle"})
+                    if _mic_listener: _mic_listener.resume()
                 log.info(f"JARVIS: {response_text}")
                 last_jarvis_response = response_text
 

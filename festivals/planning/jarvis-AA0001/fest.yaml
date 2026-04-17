@@ -1,0 +1,53 @@
+version: "1.0"
+metadata:
+  id: AA0001
+  uuid: cec5e275-15e1-4496-b6df-a4ccf77f3472
+  name: AI-Advisers-System
+  festival_type: standard
+  created_at: 2026-04-17T01:17:46.394768Z
+  initial_size_bytes: 33702
+  status_history:
+    - status: planning
+      timestamp: 2026-04-17T01:17:46.394768Z
+      path: /Users/navidavi/Documents/AI-Advisers/festivals/planning/ai-advisers-system-AA0001
+      notes: Festival created
+type_config:
+  auto_phases:
+    - INGEST
+    - PLAN
+  pending_phases:
+    - name: IMPLEMENT
+      type: implementation
+    - name: POLISH
+      type: planning
+quality_gates:
+  enabled: true
+  auto_append: true
+  implementation:
+    - id: testing
+      template: gates/implementation/QUALITY_GATE_TESTING
+      name: Testing and Verification
+      enabled: true
+    - id: review
+      template: gates/implementation/QUALITY_GATE_REVIEW
+      name: Code Review
+      enabled: true
+    - id: iterate
+      template: gates/implementation/QUALITY_GATE_ITERATE
+      name: Review Results and Iterate
+      enabled: true
+    - id: fest-commit
+      template: gates/implementation/QUALITY_GATE_FEST_COMMIT
+      name: Fest Commit Changes
+      enabled: true
+excluded_patterns:
+  - '*_planning'
+  - '*_research'
+  - '*_requirements'
+  - '*_docs'
+templates:
+  task_default: tasks/SIMPLE
+  prefer_simple: true
+tracking:
+  enabled: true
+  checksum_file: .festival-checksums.json
