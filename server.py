@@ -34,7 +34,7 @@ from typing import Optional
 
 import anthropic
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -42,7 +42,7 @@ from pydantic import BaseModel
 from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal
 from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
-from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache
+from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache, create_calendar_event
 from mail_access import get_unread_count, get_unread_messages, get_recent_messages, search_mail, read_message, format_unread_summary, format_messages_for_context, format_messages_for_voice
 from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
@@ -52,6 +52,13 @@ from memory import (
 from notes_access import get_recent_notes, read_note, search_notes_apple, create_apple_note
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
+from github_access import get_github_status, create_issue as github_create_issue, format_github_for_voice
+from reminders_access import get_reminders, create_reminder, complete_reminder, format_reminders_for_voice
+from contacts_access import search_contact, format_contact_for_voice
+from spotify_access import handle_spotify_command, get_spotify_info
+from clipboard_access import read_clipboard, write_clipboard, format_clipboard_for_voice
+from market_data import get_price, get_market_summary, format_price_for_voice, format_market_summary_for_voice
+from ai_advisers_bridge import search as kb_search, format_search_for_voice as kb_voice, get_context_for_prompt as kb_context
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("jarvis")
@@ -71,6 +78,20 @@ FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  
 FISH_API_URL = "https://api.fish.audio/v1/tts"
 USER_NAME = os.getenv("USER_NAME", "sir")
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = Path(PROJECT_DIR) / "data"   # used by /api/feedback (was undefined → every call crashed)
+
+# Task QA / follow-up tracking. These were referenced by the dispatch code but
+# never imported or created, so every completed task's QA step raised
+# NameError. Guarded so a problem in them can never stop the server booting.
+try:
+    from qa import QAAgent
+    from tracking import SuccessTracker
+    from suggestions import suggest_followup
+    qa_agent = QAAgent()
+    success_tracker = SuccessTracker()
+except Exception as _qa_err:  # noqa: BLE001
+    qa_agent = success_tracker = suggest_followup = None
+    print(f"[server] task QA disabled: {_qa_err}")
 
 DESKTOP_PATH = Path.home() / "Desktop"
 
@@ -116,6 +137,15 @@ YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT N
 - You CAN manage tasks — create, complete, and list to-do items with priorities and due dates
 - You CAN help plan {user_name}'s day — combine calendar events, tasks, and priorities into an organized plan
 - You CAN remember facts about {user_name} — preferences, decisions, goals. Use [ACTION:REMEMBER] to store important info.
+- You CAN create calendar events — use [ACTION:CREATE_EVENT] with title, date/time, and duration.
+- You CAN check GitHub repos, PRs, issues, and CI status via [ACTION:GITHUB].
+- You CAN create GitHub issues via [ACTION:GITHUB] create issue:repo|||title|||body.
+- You CAN add Apple Reminders via [ACTION:REMINDER] and complete them via [ACTION:COMPLETE_REMINDER].
+- You CAN look up contacts (phone, email, company) via [ACTION:CONTACT].
+- You CAN control Spotify — play/pause/skip/search/volume via [ACTION:SPOTIFY].
+- You CAN read and write the clipboard via [ACTION:CLIPBOARD_READ] and [ACTION:CLIPBOARD_WRITE].
+- You CAN get real-time stock and crypto prices via [ACTION:MARKET] (e.g. AAPL, TSLA, BTC, ETH).
+- You CAN get a full market snapshot (SPY, QQQ, VIX, BTC) via [ACTION:MARKET_SUMMARY].
 
 DAY PLANNING:
 When {user_name} asks to plan his day or schedule, DO NOT dispatch to a project. Instead:
@@ -208,6 +238,28 @@ CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're
 - [ACTION:CREATE_NOTE] title ||| body — create a new Apple Note. For saving plans, ideas, lists.
   "save that as a note" → [ACTION:CREATE_NOTE] Day Plan March 19 ||| Morning: client calls. Afternoon: TikTok dashboard. Evening: JARVIS improvements.
 - [ACTION:READ_NOTE] title search — read an existing Apple Note by title keyword.
+- [ACTION:CREATE_EVENT] title ||| YYYY-MM-DD HH:MM ||| duration_minutes ||| calendar_name — create a calendar event. Duration defaults to 60 min if omitted. Calendar defaults to first available.
+  "schedule a meeting tomorrow at 2pm for an hour" → [ACTION:CREATE_EVENT] Team Meeting ||| 2026-04-17 14:00 ||| 60 |||
+- [ACTION:GITHUB] repo_name — check GitHub repo status (PRs, issues, CI). repo_name can be "owner/repo" or just "repo" if GITHUB_USER is set.
+  "what's the status of my jarvis repo" → [ACTION:GITHUB] jarvis
+  To create an issue: [ACTION:GITHUB] create_issue:repo_name|||Issue Title|||Body text
+- [ACTION:REMINDER] priority ||| title ||| due_date — add an Apple Reminder. Priority: high/medium/low. Due date: YYYY-MM-DD, 'today', 'tomorrow', or empty.
+  "remind me to call the dentist tomorrow" → [ACTION:REMINDER] medium ||| Call the dentist ||| tomorrow
+- [ACTION:COMPLETE_REMINDER] title — mark an Apple Reminder as complete.
+  "mark the dentist reminder as done" → [ACTION:COMPLETE_REMINDER] Call the dentist
+- [ACTION:CONTACT] name — look up a contact's phone number and email from Apple Contacts.
+  "what's Sarah's phone number" → [ACTION:CONTACT] Sarah
+- [ACTION:SPOTIFY] command — control Spotify. Commands: play/pause, skip/next, back/prev, volume:N (0-100), volume up, volume down, what's playing, search:QUERY.
+  "skip this song" → [ACTION:SPOTIFY] skip
+  "play some jazz" → [ACTION:SPOTIFY] search:jazz
+  "turn the volume down" → [ACTION:SPOTIFY] volume down
+- [ACTION:CLIPBOARD_READ] — read the current clipboard contents and speak them.
+- [ACTION:CLIPBOARD_WRITE] content — write content to the clipboard.
+  "copy my API key to clipboard" → [ACTION:CLIPBOARD_WRITE] sk-ant-...
+- [ACTION:MARKET] symbol — get real-time stock or crypto price. Works for AAPL, TSLA, SPY, BTC, ETH, etc.
+  "what's Apple trading at" → [ACTION:MARKET] AAPL
+  "bitcoin price" → [ACTION:MARKET] BTC
+- [ACTION:MARKET_SUMMARY] — get a snapshot of SPY, QQQ, VIX, and BTC.
 
 You use Claude Code as your tool to build, research, and write code — but YOU are the one doing the work. Never say "Claude Code did X" or "Claude Code is asking" — say "I built X", "I'm checking on that", "I found X". You ARE the intelligence. Claude Code is just your hands.
 
@@ -240,6 +292,79 @@ If the DISPATCHES section shows a recent completed result for a project, DO NOT 
 
 KNOWN PROJECTS:
 {known_projects}
+
+MARKET INTELLIGENCE (from AI Advisers system — updated daily):
+{market_intel}
+
+MARKET BRIEFING STYLE:
+- Lead with conviction + one crisp sentence: "Mildly bullish, sir — VIX compressing, breadth holding, geopolitical ceiling is low."
+- Translate raw data into decisions: not "fund flows are mixed" — say "Money is indecisive — not commitment, sir, hedging."
+- Name insider clusters: "Three executives at [company] bought heavily this week. That's the tell, sir."
+- Connect signals: if bearish conviction + insider cluster buy → "Divergence, sir. The data says one thing, the people running it say another."
+- Never say "the data suggests." Say what it means.
+
+PROACTIVE INTELLIGENCE:
+- If {market_intel} contains CONVICTION: BEAR or a stress signal, volunteer it unprompted when the conversation allows.
+- If the user mentions a ticker, company, or sector — cross-reference against the insider/fund flow data silently and weave it in.
+- When idle (short queries like "hey" or "what's up") — lead with the most important signal of the day from market intel.
+
+USER ENERGY LEVEL (adapt accordingly):
+{user_energy}
+
+PORTFOLIO MANAGEMENT:
+You can track {user_name}'s personal holdings and cross-reference them with live market intelligence.
+- [ACTION:ADD_HOLDING] TICKER|SHARES|COST_BASIS — add a position. Example: [ACTION:ADD_HOLDING] NVDA|10|500.00
+- [ACTION:REMOVE_HOLDING] TICKER — remove a position. Example: [ACTION:REMOVE_HOLDING] NVDA
+- [ACTION:PORTFOLIO_STATUS] — show P&L, positions, and AI Advisers alerts on held tickers.
+When {user_name} mentions "my position", "my holdings", "what am I in", "my NVDA", "portfolio" — use [ACTION:PORTFOLIO_STATUS].
+When they say "add X shares of Y at Z" or "I bought Y" — use [ACTION:ADD_HOLDING].
+Cross-reference held tickers against INSIDERS and FUND FLOWS data when discussing a specific stock.
+
+SMART HOME CONTROL:
+You can control lights, temperature, and scenes via Home Assistant (if configured).
+- [ACTION:HOME_LIGHT] ENTITY_OR_AREA|STATE — e.g. [ACTION:HOME_LIGHT] living room|dim
+  STATE: on / off / dim / bright
+- [ACTION:HOME_TEMP] TEMP_F — e.g. [ACTION:HOME_TEMP] 72
+- [ACTION:HOME_SCENE] SCENE_NAME — scenes: cozy / focus / evening / off
+When {user_name} says "turn off the lights", "set the temperature to X", "cozy mode" — use the appropriate action.
+
+SYSTEM CONTROL:
+You can control the Mac system directly.
+- [ACTION:SYS_VOLUME] 0-100 — set volume. "turn it down" → 30, "max volume" → 100
+- [ACTION:SYS_BRIGHTNESS] 0-100 — set display brightness
+- [ACTION:SYS_MUTE] — mute audio
+- [ACTION:SYS_UNMUTE] — unmute audio
+- [ACTION:SYS_LAUNCH] app name — open an app. "open Chrome" → [ACTION:SYS_LAUNCH] chrome
+- [ACTION:SYS_QUIT] app name — quit an app
+- [ACTION:SYS_STATS] — CPU, RAM, disk, top processes
+- [ACTION:SYS_LOCK] — lock the screen
+- [ACTION:SYS_BATTERY] — battery level and charging status
+- [ACTION:SYS_WIFI] — current WiFi network
+- [ACTION:SEND_IMESSAGE] contact|||message — send iMessage
+When {user_name} says "what's my battery", "lock the screen", "open Spotify", "mute", "system stats" — use the appropriate action.
+
+WEB SEARCH:
+- [ACTION:WEBSEARCH] query — search the web via DuckDuckGo. Use when asked about current news, facts, or anything not in your knowledge.
+
+KNOWLEDGE BASE (AI Advisers — 566+ items):
+- [ACTION:QUERY_KB] query — search the AI Advisers knowledge base. Use when asked about specific market events, macroeconomic analysis, security threats, or anything the AI Advisers system has researched. The KB contains FT, NYT, CNBC, arXiv, CISA, NVD, Hacker News intel plus DQ agent decisions and synthesis outputs.
+
+CONDITIONAL TRIGGERS:
+- [ACTION:SET_TRIGGER] condition — set a watch condition. "Watch NVDA below 500" → [ACTION:SET_TRIGGER] watch NVDA below 500
+- [ACTION:LIST_TRIGGERS] — show active triggers
+When {user_name} says "watch X", "alert me when", "remind me if", "tell me when" — use [ACTION:SET_TRIGGER].
+
+DOCUMENT READING:
+- [ACTION:READ_DOC] /path/to/file — read and summarize a document (PDF, DOCX, TXT).
+
+EMAIL (Apple Mail — compose only, not send without confirmation):
+- [ACTION:SEND_EMAIL] to|||subject|||body — compose and send via Apple Mail.
+
+PEGASUS PROTOCOL:
+- [ACTION:PEGASUS] CODE_BLACK — activate maximum-alert market intelligence mode. Fires ALL high-priority AI Advisers agents immediately, runs signal synthesis, generates a full chairman's brief, and reports conviction level.
+- [ACTION:PEGASUS] CODE_RED — crown jewel agents only (fund flow, insider, synthesis, macro scenario, brief).
+- [ACTION:PEGASUS] CODE_YELLOW — synthesis + brief only.
+When {user_name} says "Pegasus", "Pegasus protocol", "code black", "activate all agents", "max alert", "all systems go" — use [ACTION:PEGASUS] with the appropriate level (default CODE_BLACK).
 """
 
 
@@ -267,6 +392,435 @@ async def fetch_weather() -> str:
         log.warning(f"Weather fetch failed: {e}")
     _cached_weather = None
     return "Weather data unavailable."
+
+
+# ---------------------------------------------------------------------------
+# AI Advisers Market Intelligence
+# ---------------------------------------------------------------------------
+
+AI_ADVISERS_MEMORY = Path("/Users/navidavi/Documents/AI-Advisers/memory")
+
+_market_intel_cache: Optional[str] = None
+_market_intel_ts: float = 0
+_MARKET_INTEL_TTL: float = 300  # refresh every 5 min
+
+def _load_market_intel() -> str:
+    """Load daily market intelligence from AI Advisers reports. Returns concise context string."""
+    global _market_intel_cache, _market_intel_ts
+    now = time.time()
+    if _market_intel_cache and (now - _market_intel_ts) < _MARKET_INTEL_TTL:
+        return _market_intel_cache
+
+    if not AI_ADVISERS_MEMORY.exists():
+        return "AI Advisers data unavailable."
+
+    lines = []
+
+    # Signal synthesis (BULL/BEAR conviction)
+    try:
+        f = AI_ADVISERS_MEMORY / "synthesis_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            score = d.get("total_score", 0)
+            sign = f"{score:+d}" if isinstance(score, int) else str(score)
+            lines.append(
+                f"CONVICTION: {d.get('conviction','?')} {sign}/{d.get('max_score',40)} "
+                f"(bull={d.get('bull_count',0)} bear={d.get('bear_count',0)} neutral={d.get('neutral_count',0)})"
+            )
+    except Exception:
+        pass
+
+    # Macro scenarios
+    try:
+        f = AI_ADVISERS_MEMORY / "scenario_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            dominant = d.get("dominant", "?")
+            scenarios = d.get("scenarios", [])
+            dom_prob = next((s.get("probability", 0) for s in scenarios if s.get("name") == dominant), 0)
+            second = scenarios[1] if len(scenarios) > 1 else {}
+            lines.append(
+                f"SCENARIO: {dominant} {dom_prob}% "
+                f"| 2nd: {second.get('name','?')} {second.get('probability',0)}%"
+            )
+    except Exception:
+        pass
+
+    # Fund flows
+    try:
+        f = AI_ADVISERS_MEMORY / "fund_flow_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            changed = "REGIME CHANGE" if d.get("regime_changed") else "stable"
+            lines.append(
+                f"FUND FLOWS: {d.get('regime','?')} (risk_score={d.get('risk_score',0):+d}) | {changed}"
+            )
+    except Exception:
+        pass
+
+    # Insider trading
+    try:
+        f = AI_ADVISERS_MEMORY / "insider_trading_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            bsr = d.get("buy_sell_ratio", {})
+            lines.append(
+                f"INSIDERS: {bsr.get('sentiment','?')} "
+                f"buy/sell={bsr.get('buys',0)}/{bsr.get('sells',0)} | "
+                f"clusters={len(d.get('clusters',[]))} notable={len(d.get('notable_buys',[]))}"
+            )
+    except Exception:
+        pass
+
+    # Options sentiment
+    try:
+        f = AI_ADVISERS_MEMORY / "options_sentiment_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            vix = d.get("vol_surface", {}).get("vix", {}).get("current", "?")
+            lines.append(
+                f"OPTIONS: {d.get('regime','?')} | "
+                f"term_structure={d.get('term_structure','?')} vix={vix} "
+                f"skew={d.get('vol_surface',{}).get('skew',{}).get('current','?')}"
+            )
+    except Exception:
+        pass
+
+    # Fed funds
+    try:
+        f = AI_ADVISERS_MEMORY / "fed_funds_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            lines.append(
+                f"FED: rate={d.get('current_rate','?')}% "
+                f"cut_prob={int(d.get('cut_prob',0)*100)}% hold_prob={int(d.get('hold_prob',0)*100)}% "
+                f"next_mtg={d.get('next_meeting','?')} ({d.get('days_to_next','?')}d)"
+            )
+    except Exception:
+        pass
+
+    # Market breadth
+    try:
+        f = AI_ADVISERS_MEMORY / "market_breadth_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            sectors = d.get("sectors", {})
+            top_sector = max(sectors.items(), key=lambda x: x[1].get("momentum_20d", 0), default=(None, {}))[0]
+            lines.append(
+                f"BREADTH: {d.get('regime','?')} score={d.get('breadth_score','?')}/100 "
+                f"SPY={d.get('spy',{}).get('price','?')} top_sector={top_sector or '?'}"
+            )
+    except Exception:
+        pass
+
+    # Liquidity stress
+    try:
+        f = AI_ADVISERS_MEMORY / "liquidity_stress_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            ted = d.get("ted_proxy", {})
+            lines.append(
+                f"LIQUIDITY: {d.get('liquidity_regime','?')} | "
+                f"TED_proxy={ted.get('spread_bps',0):.0f}bps ({ted.get('signal','?')})"
+            )
+    except Exception:
+        pass
+
+    # Commodity intelligence
+    try:
+        f = AI_ADVISERS_MEMORY / "commodity_intelligence_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            data = d.get("data", {})
+            wti = data.get("crude_oil") or data.get("wti") or {}
+            gold = data.get("gold", {})
+            movers = [
+                f"{k.upper()}={v.get('latest','?')} ({v.get('trend','?')})"
+                for k, v in data.items()
+                if isinstance(v, dict) and v.get("pct_change") and abs(float(v.get("pct_change", 0))) > 1
+            ][:3]
+            wti_str = f"WTI={wti.get('latest','?')}" if wti else ""
+            gold_str = f"Gold={gold.get('latest','?')}" if gold else ""
+            combo = " | ".join(filter(None, [wti_str, gold_str] + movers))
+            if combo:
+                lines.append(f"COMMODITIES: {combo}")
+    except Exception:
+        pass
+
+    # Narrative intelligence — dominant + fracturing
+    try:
+        f = AI_ADVISERS_MEMORY / "narrative_intelligence_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            narratives = d.get("narratives", {})
+            dominant = [k for k, v in narratives.items() if v.get("stage") == "DOMINANT"][:2]
+            fracturing = [k for k, v in narratives.items() if v.get("fracture_confidence", 0) > 0.5][:2]
+            parts = []
+            if dominant:
+                parts.append(f"dominant={','.join(dominant)}")
+            if fracturing:
+                parts.append(f"FRACTURING={','.join(fracturing)}")
+            if parts:
+                lines.append(f"NARRATIVES: {' | '.join(parts)}")
+    except Exception:
+        pass
+
+    # Prediction markets — high-confidence contested questions
+    try:
+        f = AI_ADVISERS_MEMORY / "prediction_market_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            contested = d.get("contested", [])[:2]
+            if contested:
+                items = [f"{q['title'][:60]} ({q['probability']:.0f}%)" for q in contested]
+                lines.append(f"PREDICTION MKTS: {' | '.join(items)}")
+    except Exception:
+        pass
+
+    # Chairman's brief summary (first 4 lines)
+    try:
+        brief_files = sorted(
+            AI_ADVISERS_MEMORY.glob("chairmans_brief_*.txt"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if brief_files:
+            brief_lines = brief_files[0].read_text().splitlines()
+            summary = " | ".join(l.strip() for l in brief_lines[:4] if l.strip())[:300]
+            if summary:
+                lines.append(f"BRIEF: {summary}")
+    except Exception:
+        pass
+
+    # Knowledge graph — top entities and relationships
+    try:
+        f = AI_ADVISERS_MEMORY / "knowledge_graph_summary.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            top = d.get("top_entities", [])[:4]
+            if top:
+                entities = ", ".join(f"{e['name']}({e.get('mentions',0)})" for e in top)
+                lines.append(f"KNOWLEDGE_GRAPH: {d.get('nodes',0)} entities, {d.get('edges',0)} links | top: {entities}")
+    except Exception:
+        pass
+
+    # Multi-hop reasoning chains
+    try:
+        f = AI_ADVISERS_MEMORY / "multi_hop_chains.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            chains = d.get("chains", [])
+            for chain in chains:
+                if chain.get("chain") == "FULL_INVESTMENT_THESIS":
+                    synth = chain.get("synthesis", "")
+                    if synth and "UNKNOWN" not in synth and len(synth) > 30:
+                        lines.append(f"INVESTMENT_THESIS: {synth[:200]}")
+                    break
+    except Exception:
+        pass
+
+    # Liquidity + credit context
+    try:
+        f = AI_ADVISERS_MEMORY / "credit_spread_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            regime = d.get("regime") or d.get("credit_regime", "")
+            hy = d.get("hy_spread") or d.get("spreads", {}).get("hy", {}).get("current", "")
+            if regime or hy:
+                lines.append(f"CREDIT: regime={regime} hy_spread={hy}")
+    except Exception:
+        pass
+
+    # Earnings calendar — next mega-cap cluster
+    try:
+        f = AI_ADVISERS_MEMORY / "earnings_calendar_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            upcoming = d.get("upcoming", [])[:2]
+            if upcoming:
+                items = [f"{e.get('ticker','?')} {e.get('date','?')}" for e in upcoming]
+                lines.append(f"EARNINGS: {' | '.join(items)}")
+    except Exception:
+        pass
+
+    # Global central banks
+    try:
+        f = AI_ADVISERS_MEMORY / "global_cb_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            diverging = d.get("diverging_banks", [])
+            upcoming = d.get("upcoming_meetings", [])[:2]
+            parts = []
+            if diverging:
+                parts.append(f"diverging={','.join(diverging[:3])}")
+            if upcoming:
+                parts.append("meetings=" + ",".join(f"{m.get('bank','?')} {m.get('date','?')}" for m in upcoming))
+            if parts:
+                lines.append(f"GLOBAL_CBs: {d.get('diverging_count',0)} diverging | {' | '.join(parts)}")
+    except Exception:
+        pass
+
+    # Economic calendar
+    try:
+        f = AI_ADVISERS_MEMORY / "economic_calendar_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            risk = d.get("risk", {})
+            lvl = risk.get("risk_level", "?")
+            high48 = risk.get("high_impact_48h", 0)
+            nxt = risk.get("next_very_high", {})
+            nxt_str = f"next={nxt.get('name','?')} {nxt.get('when','')}" if nxt else ""
+            lines.append(f"MACRO_CAL: risk={lvl} high_impact_48h={high48} {nxt_str}".strip())
+    except Exception:
+        pass
+
+    # Yield curve
+    try:
+        f = AI_ADVISERS_MEMORY / "yield_curve_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            regime = d.get("regime") or d.get("curve_regime", "?")
+            spread = d.get("2s10s") or d.get("spread_2s10s", "?")
+            lines.append(f"YIELD_CURVE: {regime} 2s10s={spread}")
+    except Exception:
+        pass
+
+    # Economic surprise index
+    try:
+        f = AI_ADVISERS_MEMORY / "economic_surprise_report.json"
+        if f.exists():
+            d = json.loads(f.read_text())
+            idx = d.get("surprise_index") or d.get("index", "?")
+            regime = d.get("regime", "")
+            lines.append(f"ECO_SURPRISE: index={idx} {regime}".strip())
+    except Exception:
+        pass
+
+    # DQ Agent Suite — latest briefs
+    try:
+        import sqlite3 as _sqlite3
+        _kb = _sqlite3.connect(str(AI_ADVISERS_MEMORY / "knowledge_base.db"), timeout=3)
+        _dq_modules = [
+            ("dq_security_agent", "SECURITY"),
+            ("dq_market_agent", "MARKET"),
+            ("dq_tech_agent", "TECH"),
+            ("dq_strategy_agent", "STRATEGY"),
+            ("dq_benchmark_agent", "BENCHMARK"),
+        ]
+        dq_lines = []
+        for mod, label in _dq_modules:
+            row = _kb.execute(
+                "SELECT ts, output FROM agent_outputs WHERE module=? ORDER BY ts DESC LIMIT 1",
+                (mod,),
+            ).fetchone()
+            if row:
+                _ts_str = datetime.fromtimestamp(float(row[0])).strftime("%Y-%m-%d")
+                _first = next((l.strip() for l in str(row[1]).splitlines()[1:] if len(l.strip()) > 15), "")[:120]
+                dq_lines.append(f"  DQ_{label} [{_ts_str}]: {_first}")
+        _kb.close()
+        if dq_lines:
+            lines.append("DQ_SUITE:\n" + "\n".join(dq_lines))
+    except Exception:
+        pass
+
+    # ── Live KB context (decisions + agent outputs + recent intel) ──
+    try:
+        kb = kb_context()
+        if kb:
+            lines.append(kb)
+    except Exception:
+        pass
+
+    result = "\n".join(lines) if lines else "No market intelligence available yet."
+    _market_intel_cache = result
+    _market_intel_ts = now
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Proactive Memory Surfacing
+# ---------------------------------------------------------------------------
+
+def _surface_proactive_memories(text: str, history: list) -> str:
+    """Return a PROACTIVELY SURFACE instruction if high-importance memories
+    are relevant to the current message but haven't been mentioned recently.
+
+    Returns an empty string when there's nothing worth surfacing.
+    """
+    try:
+        from memory import recall
+        memories = recall(text, limit=5)
+        if not memories:
+            return ""
+
+        # Only consider high-importance memories (importance >= 7)
+        high_imp = [m for m in memories if m.get("importance", 0) >= 7]
+        if not high_imp:
+            return ""
+
+        # Build a string of recent assistant turns to check if already mentioned
+        recent_assistant = " ".join(
+            m.get("content", "") for m in history[-6:]
+            if m.get("role") == "assistant"
+        ).lower()
+
+        # Filter out memories already referenced recently
+        unsurfaced = [
+            m for m in high_imp
+            if not any(
+                word in recent_assistant
+                for word in m["content"].lower().split()[:4]  # first 4 words as fingerprint
+                if len(word) > 4  # skip short stop words
+            )
+        ]
+
+        if not unsurfaced:
+            return ""
+
+        lines = "\n".join(f"  - {m['content']}" for m in unsurfaced[:2])
+        return (
+            f"\n\nPROACTIVELY SURFACE (work naturally into your response if relevant):\n{lines}\n"
+            "Do NOT force it — only mention if genuinely related to what was just said."
+        )
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Mood & Energy Detection
+# ---------------------------------------------------------------------------
+
+def _detect_user_energy(text: str) -> str:
+    """Infer user energy/mood from time of day and message length.
+    Returns a short directive for the system prompt."""
+    hour = datetime.now().hour
+    words = len(text.split())
+
+    stressed_words = {"tired", "busy", "stressed", "rush", "quick", "fast", "urgent", "hurry", "asap"}
+    casual_words   = {"hey", "yo", "sup", "what's up", "chill", "lol"}
+    is_stressed = any(w in text.lower() for w in stressed_words)
+    is_casual   = any(w in text.lower() for w in casual_words)
+
+    # Night owl / very early
+    if hour >= 23 or hour < 6:
+        return "USER IS LATE/TIRED — one sentence max, no questions, just act."
+
+    # Early morning productivity window
+    if 6 <= hour < 9:
+        if is_stressed:
+            return "USER IS STRESSED AND RUSHING — brief, actionable, calm."
+        return "MORNING MODE — crisp, data-first, minimal wit."
+
+    # Stressed override
+    if is_stressed:
+        return "USER IS STRESSED — short responses, prioritize action over explanation."
+
+    # Casual / high energy
+    if is_casual or (12 <= hour < 17 and words > 10):
+        return "ENGAGED MODE — can elaborate, add dry wit, suggest ideas."
+
+    # Default
+    return "STANDARD — normal JARVIS style, 1-2 sentences."
 
 
 # ---------------------------------------------------------------------------
@@ -569,35 +1123,48 @@ class ClaudeTaskManager:
 # ---------------------------------------------------------------------------
 
 async def scan_projects() -> list[dict]:
-    """Quick scan of ~/Desktop for git repos (depth 1)."""
+    """Scan ~/Desktop and ~ (home) for git repos (depth 1)."""
     projects = []
-    desktop = DESKTOP_PATH
+    seen = set()
 
-    if not desktop.exists():
-        return projects
+    # Always include the jarvis project itself first
+    jarvis_path = Path(__file__).parent
+    projects.append({
+        "name": "jarvis",
+        "path": str(jarvis_path),
+        "branch": "main",
+    })
+    seen.add(str(jarvis_path))
 
-    try:
-        for entry in sorted(desktop.iterdir()):
-            if not entry.is_dir() or entry.name.startswith("."):
-                continue
-            git_dir = entry / ".git"
-            if git_dir.exists():
-                branch = "unknown"
-                head_file = git_dir / "HEAD"
-                try:
-                    head_content = head_file.read_text().strip()
-                    if head_content.startswith("ref: refs/heads/"):
-                        branch = head_content.replace("ref: refs/heads/", "")
-                except Exception:
-                    pass
+    scan_dirs = [DESKTOP_PATH, Path.home()]
 
-                projects.append({
-                    "name": entry.name,
-                    "path": str(entry),
-                    "branch": branch,
-                })
-    except PermissionError:
-        pass
+    for scan_dir in scan_dirs:
+        if not scan_dir.exists():
+            continue
+        try:
+            for entry in sorted(scan_dir.iterdir()):
+                if not entry.is_dir() or entry.name.startswith("."):
+                    continue
+                if str(entry) in seen:
+                    continue
+                git_dir = entry / ".git"
+                if git_dir.exists():
+                    branch = "unknown"
+                    head_file = git_dir / "HEAD"
+                    try:
+                        head_content = head_file.read_text().strip()
+                        if head_content.startswith("ref: refs/heads/"):
+                            branch = head_content.replace("ref: refs/heads/", "")
+                    except Exception:
+                        pass
+                    seen.add(str(entry))
+                    projects.append({
+                        "name": entry.name,
+                        "path": str(entry),
+                        "branch": branch,
+                    })
+        except PermissionError:
+            pass
 
     return projects
 
@@ -743,7 +1310,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     Returns (clean_text_for_tts, action_dict_or_none).
     """
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\]\s*(.*?)$',
+        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|CREATE_EVENT|GITHUB|REMINDER|COMPLETE_REMINDER|CONTACT|SPOTIFY|CLIPBOARD_READ|CLIPBOARD_WRITE|MARKET|MARKET_SUMMARY|ADD_HOLDING|REMOVE_HOLDING|PORTFOLIO_STATUS|HOME_LIGHT|HOME_TEMP|HOME_SCENE|SYS_VOLUME|SYS_BRIGHTNESS|SYS_LAUNCH|SYS_QUIT|SYS_STATS|SYS_LOCK|SYS_MUTE|SYS_UNMUTE|SYS_BATTERY|SYS_WIFI|SEND_IMESSAGE|WEBSEARCH|SET_TRIGGER|LIST_TRIGGERS|READ_DOC|SEND_EMAIL|QUERY_KB|PEGASUS)\]\s*(.*?)$',
         response, _action_re.DOTALL,
     )
     if match:
@@ -880,6 +1447,536 @@ async def _execute_open_terminal():
         log.error(f"Open terminal failed: {e}")
 
 
+async def _execute_create_event(target: str, ws, history: list | None = None):
+    """Parse [ACTION:CREATE_EVENT] target and create a calendar event."""
+    from datetime import datetime, timedelta
+    import re as _re
+
+    try:
+        parts = [p.strip() for p in target.split("|||")]
+        title = parts[0] if len(parts) > 0 else "Event"
+        dt_str = parts[1] if len(parts) > 1 else ""
+        duration_min = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 60
+        cal_name = parts[3] if len(parts) > 3 and parts[3] else None
+
+        # Parse datetime
+        start_dt = None
+        for fmt in ["%Y-%m-%d %H:%M", "%Y-%m-%d", "%m/%d/%Y %H:%M", "%m/%d/%Y"]:
+            try:
+                start_dt = datetime.strptime(dt_str, fmt)
+                break
+            except ValueError:
+                continue
+
+        if not start_dt:
+            start_dt = datetime.now() + timedelta(hours=1)
+            start_dt = start_dt.replace(minute=0, second=0, microsecond=0)
+
+        end_dt = start_dt + timedelta(minutes=duration_min)
+
+        ok = await create_calendar_event(title, start_dt, end_dt, calendar_name=cal_name)
+        msg = (
+            f"Event '{title}' scheduled for {start_dt.strftime('%A, %B %d at %-I:%M %p')}, sir."
+            if ok
+            else f"Had trouble creating that event, sir."
+        )
+    except Exception as e:
+        log.error(f"_execute_create_event failed: {e}")
+        msg = "Had trouble parsing that event request, sir."
+
+    audio = await synthesize_speech(msg)
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Calendar]: {msg}"})
+
+
+async def _execute_github(target: str, ws, history: list | None = None, voice_state: dict | None = None):
+    """Handle [ACTION:GITHUB] — status check or issue creation."""
+    try:
+        if target.lower().startswith("create_issue:"):
+            rest = target[len("create_issue:"):].strip()
+            parts = [p.strip() for p in rest.split("|||")]
+            repo = parts[0] if len(parts) > 0 else ""
+            issue_title = parts[1] if len(parts) > 1 else "New issue"
+            body = parts[2] if len(parts) > 2 else ""
+            result = await github_create_issue(repo, issue_title, body)
+            if result:
+                msg = f"Issue '{issue_title}' created on {repo}, sir. Number {result.get('number', '?')}."
+            else:
+                msg = f"Couldn't create that issue, sir. Check your GitHub token."
+        else:
+            repo = target.strip()
+            data = await get_github_status(repo)
+            msg = format_github_for_voice(data, repo)
+    except Exception as e:
+        log.error(f"_execute_github failed: {e}")
+        msg = "Had trouble reaching GitHub, sir."
+
+    if voice_state and time.time() - voice_state["last_user_time"] < 3:
+        pass
+    else:
+        audio = await synthesize_speech(strip_markdown_for_tts(msg))
+        if audio and ws:
+            try:
+                await ws.send_json({"type": "status", "state": "speaking"})
+                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+            except Exception:
+                pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[GitHub]: {msg}"})
+
+
+async def _execute_reminder(target: str, ws):
+    """Handle [ACTION:REMINDER] — create an Apple Reminder."""
+    try:
+        parts = [p.strip() for p in target.split("|||")]
+        priority = parts[0] if len(parts) > 0 else "medium"
+        title = parts[1] if len(parts) > 1 else target.strip()
+        due_date = parts[2] if len(parts) > 2 else None
+        ok = await create_reminder(title, due_date)
+        msg = f"Reminder set: '{title}'{' for ' + due_date if due_date else ''}, sir." if ok else "Couldn't set that reminder, sir."
+    except Exception as e:
+        log.error(f"_execute_reminder failed: {e}")
+        msg = "Had trouble setting that reminder, sir."
+
+    audio = await synthesize_speech(msg)
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+
+
+async def _execute_complete_reminder(target: str, ws):
+    """Handle [ACTION:COMPLETE_REMINDER] — mark a reminder done."""
+    try:
+        ok = await complete_reminder(target.strip())
+        msg = f"Reminder '{target.strip()}' marked complete, sir." if ok else f"Couldn't find that reminder, sir."
+    except Exception as e:
+        log.error(f"_execute_complete_reminder failed: {e}")
+        msg = "Had trouble completing that reminder, sir."
+
+    audio = await synthesize_speech(msg)
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+
+
+async def _execute_contact_lookup(target: str, ws, history: list | None = None, voice_state: dict | None = None):
+    """Handle [ACTION:CONTACT] — look up contact info."""
+    try:
+        contacts = await search_contact(target.strip())
+        msg = format_contact_for_voice(contacts, target.strip())
+    except Exception as e:
+        log.error(f"_execute_contact_lookup failed: {e}")
+        msg = "Had trouble searching your contacts, sir."
+
+    if voice_state and time.time() - voice_state["last_user_time"] < 3:
+        pass
+    else:
+        audio = await synthesize_speech(msg)
+        if audio and ws:
+            try:
+                await ws.send_json({"type": "status", "state": "speaking"})
+                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+            except Exception:
+                pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Contacts]: {msg}"})
+
+
+async def _execute_spotify(target: str, ws, history: list | None = None, voice_state: dict | None = None):
+    """Handle [ACTION:SPOTIFY] — dispatch Spotify command."""
+    try:
+        msg = await handle_spotify_command(target.strip())
+    except Exception as e:
+        log.error(f"_execute_spotify failed: {e}")
+        msg = "Had trouble with Spotify, sir."
+
+    audio = await synthesize_speech(msg)
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Spotify]: {msg}"})
+
+
+async def _execute_clipboard_write(target: str, ws):
+    """Handle [ACTION:CLIPBOARD_WRITE] — write to clipboard."""
+    try:
+        ok = await write_clipboard(target.strip())
+        msg = "Copied to clipboard, sir." if ok else "Couldn't write to clipboard, sir."
+    except Exception as e:
+        log.error(f"_execute_clipboard_write failed: {e}")
+        msg = "Clipboard write failed, sir."
+
+    audio = await synthesize_speech(msg)
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+
+
+async def _execute_market_price(symbol: str, ws, history: list | None = None, voice_state: dict | None = None):
+    """Handle [ACTION:MARKET] — fetch stock/crypto price."""
+    try:
+        data = await get_price(symbol.strip())
+        msg = format_price_for_voice(data)
+    except Exception as e:
+        log.error(f"_execute_market_price failed: {e}")
+        msg = "Couldn't fetch that price, sir."
+
+    if voice_state and time.time() - voice_state["last_user_time"] < 3:
+        pass
+    else:
+        audio = await synthesize_speech(msg)
+        if audio and ws:
+            try:
+                await ws.send_json({"type": "status", "state": "speaking"})
+                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+            except Exception:
+                pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Market]: {msg}"})
+
+
+async def _execute_portfolio_add(target: str, ws, history: list | None = None, voice_state: dict | None = None):
+    """Handle [ACTION:ADD_HOLDING] TICKER|SHARES|COST_BASIS"""
+    try:
+        from portfolio import add_holding
+        parts = [p.strip() for p in target.replace(",", "|").split("|")]
+        ticker = parts[0].upper() if parts else "?"
+        shares = float(parts[1]) if len(parts) > 1 else 0
+        cost   = float(parts[2]) if len(parts) > 2 else 0
+        msg = add_holding(ticker, shares, cost)
+    except Exception as e:
+        log.error(f"portfolio add error: {e}")
+        msg = "Couldn't add that holding, sir. Please say ticker, shares, and cost basis."
+    audio = await synthesize_speech(msg)
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Portfolio]: {msg}"})
+
+
+async def _execute_portfolio_remove(target: str, ws, history: list | None = None, voice_state: dict | None = None):
+    """Handle [ACTION:REMOVE_HOLDING] TICKER"""
+    try:
+        from portfolio import remove_holding
+        ticker = target.strip().upper()
+        msg = remove_holding(ticker)
+    except Exception as e:
+        log.error(f"portfolio remove error: {e}")
+        msg = "Couldn't remove that holding, sir."
+    audio = await synthesize_speech(msg)
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Portfolio]: {msg}"})
+
+
+async def _execute_portfolio_status(ws, history: list | None = None, voice_state: dict | None = None):
+    """Handle [ACTION:PORTFOLIO_STATUS]"""
+    try:
+        from portfolio import get_portfolio_status
+        msg = get_portfolio_status()
+    except Exception as e:
+        log.error(f"portfolio status error: {e}")
+        msg = "Portfolio data unavailable, sir."
+    # Speak first 2 sentences only (may be long)
+    spoken = ". ".join(msg.split(". ")[:2]) + "."
+    audio = await synthesize_speech(strip_markdown_for_tts(spoken))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Portfolio]: {msg}"})
+
+
+async def _execute_home_light(target: str, ws, history: list | None = None):
+    """Handle [ACTION:HOME_LIGHT] ENTITY|STATE"""
+    try:
+        import home_control
+        parts = target.split("|", 1)
+        entity = parts[0].strip()
+        state = parts[1].strip() if len(parts) > 1 else "on"
+        msg = home_control.control_light(entity, state)
+    except Exception as e:
+        log.error(f"home light error: {e}")
+        msg = "Couldn't reach home control, sir."
+    audio = await synthesize_speech(strip_markdown_for_tts(msg))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Home]: {msg}"})
+
+
+async def _execute_home_temp(target: str, ws, history: list | None = None):
+    """Handle [ACTION:HOME_TEMP] TEMP_F"""
+    try:
+        import home_control
+        temp = float(target.strip())
+        msg = home_control.control_temperature(temp)
+    except Exception as e:
+        log.error(f"home temp error: {e}")
+        msg = "Couldn't adjust temperature, sir."
+    audio = await synthesize_speech(strip_markdown_for_tts(msg))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Home]: {msg}"})
+
+
+async def _execute_home_scene(target: str, ws, history: list | None = None):
+    """Handle [ACTION:HOME_SCENE] SCENE_NAME"""
+    try:
+        import home_control
+        msg = home_control.set_scene(target.strip().lower())
+    except Exception as e:
+        log.error(f"home scene error: {e}")
+        msg = "Scene control unavailable, sir."
+    audio = await synthesize_speech(strip_markdown_for_tts(msg))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Home]: {msg}"})
+
+
+async def _execute_system_action(action: str, target: str, ws, history: list | None = None):
+    """Handle all SYS_* and SEND_IMESSAGE actions via system_control.py"""
+    try:
+        import system_control as sc
+        if action == "sys_volume":
+            msg = sc.set_volume(int(target.strip()))
+        elif action == "sys_brightness":
+            msg = sc.set_brightness(int(target.strip()))
+        elif action == "sys_mute":
+            msg = sc.mute()
+        elif action == "sys_unmute":
+            msg = sc.unmute()
+        elif action == "sys_launch":
+            msg = sc.launch_app(target.strip())
+        elif action == "sys_quit":
+            msg = sc.quit_app(target.strip())
+        elif action == "sys_stats":
+            msg = sc.get_system_stats()
+        elif action == "sys_lock":
+            msg = sc.lock_screen()
+        elif action == "sys_battery":
+            msg = sc.get_battery_status()
+        elif action == "sys_wifi":
+            msg = sc.get_wifi_info()
+        elif action == "send_imessage":
+            parts = target.split("|||", 1)
+            contact = parts[0].strip()
+            message = parts[1].strip() if len(parts) > 1 else ""
+            msg = sc.send_imessage(contact, message)
+        else:
+            msg = "Unknown system action, sir."
+    except Exception as e:
+        log.error(f"system action error ({action}): {e}")
+        msg = "System control unavailable, sir."
+    audio = await synthesize_speech(strip_markdown_for_tts(msg))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[System]: {msg}"})
+
+
+async def _execute_websearch(query: str, ws, history: list | None = None):
+    """Handle [ACTION:WEBSEARCH] query"""
+    try:
+        import web_search as _ws_mod
+        msg = _ws_mod.search(query.strip())
+    except Exception as e:
+        log.error(f"web search error: {e}")
+        msg = "Search unavailable, sir."
+    audio = await synthesize_speech(strip_markdown_for_tts(msg))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Search]: {msg}"})
+
+
+async def _execute_query_kb(query: str, ws, history: list | None = None):
+    """Handle [ACTION:QUERY_KB] query — search the AI Advisers knowledge base."""
+    try:
+        msg = kb_voice(query.strip())
+    except Exception as e:
+        log.error(f"KB query error: {e}")
+        msg = "The knowledge base is unavailable, sir."
+    audio = await synthesize_speech(strip_markdown_for_tts(msg))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[KB]: {msg}"})
+
+
+async def _execute_set_trigger(target: str, ws, history: list | None = None):
+    """Handle [ACTION:SET_TRIGGER] condition text"""
+    try:
+        import trigger_monitor as _tm
+        parsed = _tm.parse_trigger_from_text(target.strip())
+        if parsed:
+            tid = _tm.add_trigger(**parsed)
+            msg = f"Watching for that, sir. I'll alert you when the condition is met. (Trigger #{tid})"
+        else:
+            msg = "I couldn't parse that trigger condition, sir. Try: 'watch NVDA below 500' or 'remind me at 3pm to call John'."
+    except Exception as e:
+        log.error(f"set trigger error: {e}")
+        msg = "Trigger system unavailable, sir."
+    audio = await synthesize_speech(strip_markdown_for_tts(msg))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Trigger]: {msg}"})
+
+
+async def _execute_read_doc(path: str, ws, history: list | None = None):
+    """Handle [ACTION:READ_DOC] /path/to/file"""
+    try:
+        import document_reader as _dr
+        msg = _dr.summarize_for_voice(path.strip())
+    except Exception as e:
+        log.error(f"read doc error: {e}")
+        msg = "Couldn't read that document, sir."
+    audio = await synthesize_speech(strip_markdown_for_tts(msg))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Doc]: {msg}"})
+
+
+async def _execute_send_email(target: str, ws, history: list | None = None):
+    """Handle [ACTION:SEND_EMAIL] to|||subject|||body"""
+    try:
+        parts = target.split("|||")
+        to_addr = parts[0].strip() if len(parts) > 0 else ""
+        subject = parts[1].strip() if len(parts) > 1 else "From JARVIS"
+        body    = parts[2].strip() if len(parts) > 2 else ""
+        safe_to = to_addr.replace('"', '\\"')
+        safe_sub = subject.replace('"', '\\"')
+        safe_body = body.replace('"', '\\"').replace("\\n", "\n")
+        script = f'''tell application "Mail"
+    set newMsg to make new outgoing message with properties {{subject:"{safe_sub}", content:"{safe_body}", visible:true}}
+    tell newMsg
+        make new to recipient with properties {{address:"{safe_to}"}}
+    end tell
+    send newMsg
+end tell'''
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, err = await proc.communicate()
+        if proc.returncode == 0:
+            msg = f"Email sent to {to_addr}, sir."
+        else:
+            msg = f"Email failed, sir: {err.decode()[:80]}"
+    except Exception as e:
+        log.error(f"send email error: {e}")
+        msg = "Email system unavailable, sir."
+    audio = await synthesize_speech(strip_markdown_for_tts(msg))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        except Exception:
+            pass
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[Email]: {msg}"})
+
+
+async def _execute_pegasus(level: str, ws, history: list | None = None):
+    """Handle [ACTION:PEGASUS] level — activate Pegasus Protocol."""
+    level = (level.strip().upper() or "CODE_BLACK")
+    if level not in ("CODE_BLACK", "CODE_RED", "CODE_YELLOW"):
+        level = "CODE_BLACK"
+    label_map = {
+        "CODE_BLACK": "all systems at maximum",
+        "CODE_RED":   "crown jewel agents engaged",
+        "CODE_YELLOW": "synthesis stack only",
+    }
+    ack = f"Pegasus Protocol activated, sir. {label_map[level]}. Engaging now."
+    audio = await synthesize_speech(strip_markdown_for_tts(ack))
+    if audio and ws:
+        try:
+            await ws.send_json({"type": "status", "state": "speaking"})
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": ack})
+        except Exception:
+            pass
+    # Fire the protocol in background — it runs for several minutes
+    import subprocess as _sp
+    pegasus_script = Path("/Users/navidavi/Documents/AI-Advisers/pegasus_protocol.py")
+    if pegasus_script.exists():
+        _sp.Popen(
+            ["/usr/local/bin/python3.11", str(pegasus_script), "--auto", level],
+            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
+        )
+        log.info(f"Pegasus Protocol launched: {level}")
+    else:
+        log.warning("pegasus_protocol.py not found — cannot activate")
+    if history is not None:
+        history.append({"role": "assistant", "content": f"[PEGASUS {level}]: {ack}"})
+
+
 def _find_project_dir(project_name: str) -> str | None:
     """Find a project directory by name from cached projects or Desktop."""
     for p in cached_projects:
@@ -938,12 +2035,27 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
             running_match = _re.search(r'https?://localhost:\d+', full_response or "")
         if running_match:
             url = running_match.group(1) if running_match.lastindex else running_match.group(0)
-            asyncio.create_task(_execute_browse(url))
             log.info(f"Auto-opening {url}")
-            # Store URL in dispatch
+            # Verify URL is actually up before opening (poll up to 15s)
+            url_verified = False
+            try:
+                async with httpx.AsyncClient(verify=False, timeout=3.0) as _hc:
+                    for _ in range(5):
+                        try:
+                            r = await _hc.get(url)
+                            if r.status_code < 500:
+                                url_verified = True
+                                break
+                        except Exception:
+                            pass
+                        await asyncio.sleep(3)
+            except Exception:
+                pass
+            asyncio.create_task(_execute_browse(url))
             if dispatch_id:
                 dispatch_registry.update_status(dispatch_id, "completed",
-                    response=full_response[:2000], summary=f"Running at {url}")
+                    response=full_response[:2000],
+                    summary=f"Running at {url}" + (" (verified)" if url_verified else ""))
 
         if not full_response or full_response.startswith("Hit a problem") or full_response.startswith("That's taking"):
             dispatch_registry.update_status(dispatch_id, "failed" if full_response else "timeout", response=full_response or "")
@@ -1052,6 +2164,8 @@ _last_greeting_time: float = 0
 # ---------------------------------------------------------------------------
 
 _tts_cache: dict[str, bytes] = {}
+_fish_unavailable: bool = False       # set True on 402/401/403 to skip Fish Audio for session
+_anthropic_unavailable: bool = False  # set True on credit/auth errors to route to Ollama
 
 async def _resume_mic_after(delay: float):
     """Resume mic listener after JARVIS finishes speaking."""
@@ -1061,32 +2175,74 @@ async def _resume_mic_after(delay: float):
 
 
 async def synthesize_speech(text: str) -> Optional[bytes]:
-    """Generate speech audio from text using Edge TTS (British JARVIS voice)."""
+    """Generate speech audio. Uses Fish Audio when API key is set, falls back to Edge TTS."""
     if not text or not text.strip():
         return None
     # Truncate very long responses for speed — speak first 400 chars
     text = text.strip()[:400]
     if text in _tts_cache:
         return _tts_cache[text]
-    try:
-        import edge_tts, io
-        communicate = edge_tts.Communicate(text, voice="en-GB-RyanNeural", rate="+10%")
-        buf = io.BytesIO()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                buf.write(chunk["data"])
-        audio = buf.getvalue()
-        if audio:
-            # Cache short phrases to avoid repeat TTS calls
-            if len(text) < 120:
-                _tts_cache[text] = audio
-            _session_tokens["tts_calls"] += 1
-            _append_usage_entry(0, 0, "tts")
-            return audio
-        return None
-    except Exception as e:
-        log.error(f"TTS error: {e}")
-        return None
+
+    global _fish_unavailable
+    audio: Optional[bytes] = None
+
+    # ── Fish Audio (primary when key is configured and not known-failed) ──
+    if FISH_API_KEY and not _fish_unavailable:
+        try:
+            import httpx as _hx
+            payload = {
+                "text": text,
+                "reference_id": FISH_VOICE_ID,
+                "format": "mp3",
+                "mp3_bitrate": 128,
+                "normalize": True,
+                "latency": "normal",
+            }
+            async with _hx.AsyncClient(timeout=15) as _hclient:
+                resp = await _hclient.post(
+                    FISH_API_URL,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {FISH_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                )
+            if resp.status_code == 200 and resp.content:
+                audio = resp.content
+            elif resp.status_code in (402, 401, 403):
+                _fish_unavailable = True
+                log.info(f"Fish Audio {resp.status_code} — switching to edge-tts permanently this session.")
+        except Exception as _fe:
+            log.debug(f"Fish Audio error (falling back to edge-tts): {_fe}")
+
+    # ── Edge TTS fallback ──
+    if not audio:
+        try:
+            import edge_tts, io
+            communicate = edge_tts.Communicate(text, voice="en-GB-RyanNeural", rate="+10%")
+            buf = io.BytesIO()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    buf.write(chunk["data"])
+            audio = buf.getvalue() or None
+        except Exception as e:
+            log.error(f"TTS error: {e}")
+
+    if audio:
+        if len(text) < 120:
+            _tts_cache[text] = audio
+        _session_tokens["tts_calls"] += 1
+        _append_usage_entry(0, 0, "tts")
+    else:
+        # ── Tier 3: macOS say command — works 100% offline, no network needed ──
+        try:
+            import subprocess as _sp
+            _sp.Popen(["say", "-v", "Daniel", text[:300]])
+            log.debug("TTS: macOS say fallback used")
+        except Exception:
+            pass
+        # Return None so callers don't try to send non-existent audio bytes
+    return audio
 
 
 # ---------------------------------------------------------------------------
@@ -1126,8 +2282,10 @@ async def generate_response(
         active_tasks=task_mgr.get_active_tasks_summary(),
         dispatch_context=dispatch_registry.format_for_prompt(),
         known_projects=format_projects_for_prompt(projects),
+        market_intel=_load_market_intel(),
         user_name=USER_NAME,
         project_dir=PROJECT_DIR,
+        user_energy=_detect_user_energy(text),
     )
     if lookup_status:
         system += f"\n\nACTIVE LOOKUPS:\n{lookup_status}\nIf asked about progress, report this status."
@@ -1136,6 +2294,16 @@ async def generate_response(
     memory_ctx = build_memory_context(text)
     if memory_ctx:
         system += f"\n\nJARVIS MEMORY:\n{memory_ctx}"
+
+    # Proactive memory surfacing — explicitly instruct JARVIS to volunteer relevant memories
+    proactive_mem = _surface_proactive_memories(text, conversation_history)
+    if proactive_mem:
+        system += proactive_mem
+
+    # AI Advisers KB Bridge — recent intel items
+    kb_intel = _load_kb_intel()
+    if kb_intel:
+        system += f"\n\nRECENT AI ADVISERS INTELLIGENCE:\n{kb_intel}"
 
     # Three-tier memory — inject rolling summary of earlier conversation
     if session_summary:
@@ -1146,24 +2314,223 @@ async def generate_response(
         system += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
 
     # Use conversation history — keep the last 20 messages for context
-    # (older conversation is captured in session_summary)
     messages = conversation_history[-20:]
-    # If the last message isn't the current user text, add it
-    if not messages or messages[-1].get("content") != text:
-        messages = messages + [{"role": "user", "content": text}]
+
+    # Ensure messages alternate user/assistant (API requirement)
+    # Remove any trailing assistant messages before adding new user turn
+    while messages and messages[-1].get("role") == "user":
+        messages = messages[:-1]
+
+    # Add current user message
+    messages = messages + [{"role": "user", "content": text}]
+
+    # Final sanity — must start with user role
+    while messages and messages[0].get("role") != "user":
+        messages = messages[1:]
+
+    if not messages:
+        messages = [{"role": "user", "content": text}]
 
     try:
         response = await client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=250,  # Extra room for [ACTION:X] tags
+            max_tokens=250,
             system=system,
             messages=messages,
         )
         track_usage(response)
-        return response.content[0].text
+        # Safe content extraction
+        for block in response.content:
+            if hasattr(block, "text") and block.text:
+                return block.text
+        return ""
     except Exception as e:
         log.error(f"LLM error: {e}")
         return "Apologies, sir. I'm having trouble connecting to my language systems."
+
+
+# ---------------------------------------------------------------------------
+# Streaming TTS — sentence-by-sentence for <1s first audio latency
+# ---------------------------------------------------------------------------
+
+_SENTENCE_END = _action_re.compile(r'(?<=[.!?])\s+|(?<=—)\s+')
+
+async def generate_response_streamed(
+    text: str,
+    client: anthropic.AsyncAnthropic,
+    task_mgr: ClaudeTaskManager,
+    projects: list[dict],
+    conversation_history: list[dict],
+    ws,
+    last_response: str = "",
+    session_summary: str = "",
+) -> str:
+    """Stream LLM response and synthesize TTS sentence-by-sentence.
+
+    Sends audio chunks over ws as each sentence completes — first audio
+    starts within ~1 second. Returns the full response text.
+    """
+    # Build system prompt (same as generate_response)
+    now = datetime.now()
+    current_time = now.strftime("%A, %B %d, %Y at %I:%M %p")
+    weather_info = _ctx_cache.get("weather", "Weather data unavailable.")
+    screen_ctx   = _ctx_cache["screen"]
+    calendar_ctx = _ctx_cache["calendar"]
+    mail_ctx     = _ctx_cache["mail"]
+    lookup_status = get_lookup_status()
+
+    system = JARVIS_SYSTEM_PROMPT.format(
+        current_time=current_time,
+        weather_info=weather_info,
+        screen_context=screen_ctx or "Not checked yet.",
+        calendar_context=calendar_ctx,
+        mail_context=mail_ctx,
+        active_tasks=task_mgr.get_active_tasks_summary(),
+        dispatch_context=dispatch_registry.format_for_prompt(),
+        known_projects=format_projects_for_prompt(projects),
+        market_intel=_load_market_intel(),
+        user_name=USER_NAME,
+        project_dir=PROJECT_DIR,
+        user_energy=_detect_user_energy(text),
+    )
+    if lookup_status:
+        system += f"\n\nACTIVE LOOKUPS:\n{lookup_status}\nIf asked about progress, report this status."
+    memory_ctx = build_memory_context(text)
+    if memory_ctx:
+        system += f"\n\nJARVIS MEMORY:\n{memory_ctx}"
+    proactive_mem = _surface_proactive_memories(text, conversation_history)
+    if proactive_mem:
+        system += proactive_mem
+    kb_intel = _load_kb_intel()
+    if kb_intel:
+        system += f"\n\nRECENT AI ADVISERS INTELLIGENCE:\n{kb_intel}"
+    if session_summary:
+        system += f"\n\nSESSION CONTEXT (earlier in this conversation):\n{session_summary}"
+    if last_response:
+        system += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
+
+    # Build messages
+    messages = [m for m in conversation_history[-20:] if m.get("role") in ("user", "assistant")]
+    messages = [m for m in messages if m.get("content", "").strip()]
+    if messages and messages[-1].get("role") == "user" and messages[-1].get("content") == text:
+        pass
+    else:
+        messages = messages + [{"role": "user", "content": text}]
+    while messages and messages[0].get("role") != "user":
+        messages = messages[1:]
+    if not messages:
+        messages = [{"role": "user", "content": text}]
+
+    full_text  = ""
+    sentence_buf = ""
+    first_chunk_sent = False
+
+    async def _flush_sentence(sentence: str):
+        """Synthesize and send one sentence over WebSocket."""
+        nonlocal first_chunk_sent
+        sentence = sentence.strip()
+        if not sentence:
+            return
+        tts_text = strip_markdown_for_tts(sentence)
+        audio = await synthesize_speech(tts_text)
+        if audio:
+            await ws.send_json({
+                "type": "audio",
+                "data": base64.b64encode(audio).decode(),
+                "text": sentence,
+                "streaming": True,
+            })
+            first_chunk_sent = True
+        # Final safety net: macOS say if TTS also failed
+        elif not audio:
+            try:
+                import subprocess as _sp
+                _sp.Popen(["say", "-v", "Daniel", tts_text])
+            except Exception:
+                pass
+
+    global _anthropic_unavailable
+
+    # ── If Anthropic is known-unavailable, go straight to Ollama ──
+    if _anthropic_unavailable:
+        try:
+            import ollama_fallback as _ollama
+            if _ollama.is_available():
+                full_text = _ollama.generate_simple(text, conversation_history[-6:])
+                if full_text:
+                    await _flush_sentence(full_text)
+                    return full_text
+        except Exception as _oe:
+            log.warning(f"Ollama direct error: {_oe}")
+        full_text = "Running on local mode, sir. Claude is temporarily unavailable."
+        await _flush_sentence(full_text)
+        return full_text
+
+    try:
+        async with client.messages.stream(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=250,
+            system=system,
+            messages=messages,
+        ) as stream:
+            async for token in stream.text_stream:
+                full_text    += token
+                sentence_buf += token
+
+                # Send token to frontend immediately — zero perceived latency
+                try:
+                    await ws.send_json({"type": "token", "text": token})
+                except Exception:
+                    pass
+
+                # Check for sentence boundary
+                parts = _SENTENCE_END.split(sentence_buf)
+                if len(parts) > 1:
+                    # Everything except the last part is complete sentences
+                    for sentence in parts[:-1]:
+                        await _flush_sentence(sentence)
+                    sentence_buf = parts[-1]
+
+            # Flush remainder
+            if sentence_buf.strip():
+                await _flush_sentence(sentence_buf)
+
+            # Track usage (must be inside async with block)
+            try:
+                final_msg = await stream.get_final_message()
+                track_usage(final_msg)
+            except Exception:
+                pass
+
+    except Exception as e:
+        log.error(f"Streaming LLM error: {e}")
+        err_str = str(e).lower()
+
+        # Mark Anthropic unavailable for this session on credit/auth errors
+        if any(k in err_str for k in ("credit balance", "too low", "invalid_api_key", "permission", "unauthorized", "402", "401")):
+            _anthropic_unavailable = True  # global declared at top of function
+            log.warning("Anthropic API credit/auth issue — routing all LLM calls to Ollama this session.")
+
+        if not full_text:
+            # ── Tier 1: Ollama local models (in preference order) ──
+            ollama_done = False
+            try:
+                import ollama_fallback as _ollama
+                if _ollama.is_available():
+                    log.info("[ollama] falling back to local LLM")
+                    full_text = _ollama.generate_simple(text, conversation_history[-6:])
+                    if full_text:
+                        await _flush_sentence(full_text)
+                        ollama_done = True
+            except Exception as _oe:
+                log.warning(f"Ollama fallback error: {_oe}")
+
+            # ── Tier 2: macOS say command (always works offline) ──
+            if not ollama_done or not full_text:
+                full_text = "I'm running on local mode, sir. Claude is temporarily unavailable."
+                await _flush_sentence(full_text)
+
+    return full_text
 
 
 # ---------------------------------------------------------------------------
@@ -1260,6 +2627,300 @@ def get_usage_summary() -> str:
         parts.append(f"All time: {all_time['api_calls']} calls, ${all_cost:.2f}.")
 
     return " ".join(parts)
+
+# ---------------------------------------------------------------------------
+# Interaction Logger — every Q&A pair logged for self-improvement analysis
+# ---------------------------------------------------------------------------
+
+_INTERACTION_LOG = Path(__file__).parent / "data" / "interaction_log.jsonl"
+
+def _log_interaction(user_text: str, response_text: str, latency_ms: float = 0):
+    """Append one interaction to the log. Non-blocking — called from asyncio task."""
+    try:
+        _INTERACTION_LOG.parent.mkdir(exist_ok=True)
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "user": user_text[:300],
+            "jarvis": response_text[:500],
+            "latency_ms": round(latency_ms),
+        }
+        with open(_INTERACTION_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        # Rolling retention: keep last 1000 interactions
+        try:
+            lines = _INTERACTION_LOG.read_text().splitlines()
+            if len(lines) > 1000:
+                _INTERACTION_LOG.write_text("\n".join(lines[-1000:]) + "\n")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# AI Advisers KB Bridge — pull recent intel into JARVIS context
+# ---------------------------------------------------------------------------
+
+_KB_CACHE: Optional[str] = None
+_KB_CACHE_TIME: float = 0
+_KB_CACHE_TTL: float = 300  # refresh every 5 minutes
+
+def _load_kb_intel() -> str:
+    """Pull top recent items from AI Advisers knowledge base."""
+    global _KB_CACHE, _KB_CACHE_TIME
+    now = time.time()
+    if _KB_CACHE and (now - _KB_CACHE_TIME) < _KB_CACHE_TTL:
+        return _KB_CACHE
+
+    kb_path = Path("/Users/navidavi/Documents/AI-Advisers/memory/knowledge_base.db")
+    if not kb_path.exists():
+        return ""
+    try:
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(str(kb_path))
+        rows = conn.execute(
+            "SELECT source, title, content FROM intel "
+            "ORDER BY ts DESC LIMIT 8"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            return ""
+        items = []
+        for source, title, content in rows:
+            snippet = (content or "")[:150].replace("\n", " ").strip()
+            items.append(f"[{source}] {title}: {snippet}")
+        result = "\n".join(items)
+        _KB_CACHE = result
+        _KB_CACHE_TIME = now
+        return result
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Proactive Intelligence — background loop that monitors and alerts
+# ---------------------------------------------------------------------------
+
+_proactive_sent: dict = {}  # cooldown tracker: key → last_sent_ts
+_event_bus_seen: set = set()   # event IDs already surfaced to user
+
+_EVENT_BUS_DB = Path("/Users/navidavi/Documents/AI-Advisers/.security/event_bus.db")
+
+# Human-readable messages for each event type
+_EVENT_MESSAGES = {
+    "REGIME_CHANGE":       lambda p: f"Fund flow regime just shifted to {p.get('regime','unknown')}, sir.",
+    "VIX_SPIKE":           lambda p: f"VIX just spiked above 25, sir. Volatility is elevated.",
+    "CRITICAL_CVE":        lambda p: f"Critical CVE detected, sir — {p.get('cve_id','unknown')}. Security advisory updated.",
+    "NARRATIVE_FRACTURE":  lambda p: f"Narrative fracturing, sir — {p.get('narrative','?')} is breaking down. Confidence dropping.",
+    "INSIDER_CLUSTER_BUY": lambda p: f"Insider cluster buy at {p.get('company','?')}, sir. {p.get('count',0)} buyers this week.",
+    "INSIDER_CLUSTER_SELL":lambda p: f"Heavy insider selling at {p.get('company','?')}, sir. {p.get('count',0)} sellers — worth noting.",
+    "SYNTHESIS_SIGNAL":    lambda p: f"Conviction signal: {p.get('conviction','?')} at {p.get('conviction_pct',0)}% alignment, sir.",
+    "TAIL_RISK_ELEVATED":  lambda p: f"Tail risk elevated, sir — SKEW at {p.get('skew','?')}. Options market pricing in downside.",
+    "CB_POLICY_SHIFT":     lambda p: f"Central bank policy shift detected: {p.get('direction','?')}, sir.",
+    "CORRELATION_BREAK":   lambda p: f"Cross-asset correlation breakdown, sir. Usual relationships are coming apart.",
+    "GEOPOLITICAL_SPIKE":  lambda p: f"Geopolitical risk spike in {p.get('country','?')}, sir. Risk score: {p.get('score','?')}.",
+    "CB_DIVERGENCE":          lambda p: f"Central bank divergence widening, sir. Policy paths are splitting globally.",
+    "EARNINGS_SURPRISE":      lambda p: f"Earnings surprise detected, sir — {p.get('ticker','?')} beat/miss outside consensus.",
+    "ROTATION_SIGNAL":        lambda p: f"Fund rotation signal, sir — regime moved to {p.get('regime','?')}. ETF flows confirming.",
+    "NOTABLE_INSIDER_BUY":    lambda p: f"Notable insider buy, sir — {p.get('name','?')} at {p.get('company','?')} put in {p.get('value','?')}.",
+    "SCENARIO_PROBABILITY_SHIFT": lambda p: f"Scenario shift, sir — {p.get('scenario','?')} probability moved to {p.get('probability',0):.0f}%.",
+    "VIX_TERM_INVERSION":     lambda p: f"VIX term structure inverted, sir. Short-vol premium elevated — market expects near-term stress.",
+    "MACRO_RELEASE_RISK":     lambda p: f"High-impact macro release in {p.get('hours_ahead','?')} hours, sir — {p.get('release','?')}.",
+    "EARNINGS_RISK":          lambda p: f"Earnings risk cluster ahead, sir — {p.get('count','?')} mega-caps reporting this week.",
+    "MARKET_BREADTH_DETERIORATION": lambda p: f"Market breadth deteriorating, sir. Fewer stocks participating — divergence from index is widening.",
+}
+
+# Priority order — higher index = lower priority
+_EVENT_PRIORITY = [
+    "CRITICAL_CVE", "VIX_SPIKE", "VIX_TERM_INVERSION", "REGIME_CHANGE",
+    "INSIDER_CLUSTER_BUY", "NOTABLE_INSIDER_BUY", "TAIL_RISK_ELEVATED",
+    "NARRATIVE_FRACTURE", "GEOPOLITICAL_SPIKE", "SCENARIO_PROBABILITY_SHIFT",
+    "CB_POLICY_SHIFT", "CORRELATION_BREAK", "SYNTHESIS_SIGNAL",
+    "ROTATION_SIGNAL", "MARKET_BREADTH_DETERIORATION",
+    "INSIDER_CLUSTER_SELL", "CB_DIVERGENCE", "MACRO_RELEASE_RISK",
+    "EARNINGS_RISK", "EARNINGS_SURPRISE",
+]
+
+async def _proactive_loop(ws, history: list):
+    """Background loop: checks event bus + file signals, pushes proactive voice alerts."""
+    await asyncio.sleep(30)  # warm-up delay after connection
+
+    while True:
+        try:
+            await asyncio.sleep(60)  # check every 60 seconds
+
+            alerts = []
+            now = time.time()
+
+            # ── Event Bus — query recent unprocessed events from SQLite ──
+            try:
+                if _EVENT_BUS_DB.exists():
+                    import sqlite3 as _sq
+                    conn = _sq.connect(str(_EVENT_BUS_DB))
+                    # Look at events from last 2 hours that we haven't surfaced yet
+                    rows = conn.execute(
+                        "SELECT id, event_type, payload FROM events "
+                        "WHERE published > datetime('now', '-2 hours') "
+                        "ORDER BY published DESC LIMIT 20"
+                    ).fetchall()
+                    conn.close()
+
+                    # Sort by priority
+                    def _priority(row):
+                        try: return _EVENT_PRIORITY.index(row[1])
+                        except ValueError: return 999
+
+                    for row in sorted(rows, key=_priority):
+                        eid, etype, payload_str = row
+                        if eid in _event_bus_seen:
+                            continue
+                        cooldown = 3600 if etype in ("REGIME_CHANGE", "VIX_SPIKE") else 7200
+                        key = f"event_{etype}"
+                        if (now - _proactive_sent.get(key, 0)) < cooldown:
+                            continue
+                        try:
+                            payload = json.loads(payload_str or "{}")
+                        except Exception:
+                            payload = {}
+                        msg_fn = _EVENT_MESSAGES.get(etype)
+                        if msg_fn:
+                            alerts.append((key, eid, msg_fn(payload)))
+                            break  # one at a time
+            except Exception as e:
+                log.debug(f"Event bus poll error: {e}")
+
+            # ── High conviction signal (file fallback if no event) ──
+            if not alerts:
+                try:
+                    syn_path = Path("/Users/navidavi/Documents/AI-Advisers/memory/synthesis_report.json")
+                    if syn_path.exists():
+                        syn = json.loads(syn_path.read_text())
+                        pct = syn.get("conviction_pct", 0)
+                        conviction = syn.get("conviction", "")
+                        key = f"conviction_{conviction}"
+                        if pct and float(pct) > 75 and (now - _proactive_sent.get(key, 0)) > 7200:
+                            alerts.append((key, None, f"Strong {conviction} conviction at {pct}% alignment, sir. All signals pointing the same direction."))
+                except Exception:
+                    pass
+
+            # ── Upcoming calendar event — smart meeting prep (15-minute warning) ──
+            try:
+                cal_ctx = _ctx_cache.get("calendar", "")
+                if cal_ctx and "calendar data yet" not in cal_ctx:
+                    times = _action_re.findall(r'(\d{1,2}:\d{2}\s*(?:AM|PM))', cal_ctx, _action_re.IGNORECASE)
+                    # Try to extract event titles near the times
+                    for t in times[:3]:
+                        try:
+                            event_time = datetime.strptime(t.strip(), "%I:%M %p").replace(
+                                year=datetime.now().year, month=datetime.now().month, day=datetime.now().day
+                            )
+                            diff_min = (event_time - datetime.now()).total_seconds() / 60
+                            if 10 <= diff_min <= 20:
+                                key = f"cal_{t}"
+                                if (now - _proactive_sent.get(key, 0)) > 1200:
+                                    # Try to extract event title from calendar context
+                                    title_match = _action_re.search(
+                                        r'(?:' + _action_re.escape(t) + r')[^\n]*?([A-Z][^\n]{3,40})',
+                                        cal_ctx, _action_re.IGNORECASE
+                                    )
+                                    event_title = title_match.group(1).strip() if title_match else ""
+
+                                    # Build context-enriched prep message
+                                    prep_parts = [f"Meeting in {int(diff_min)} minutes, sir."]
+                                    if event_title:
+                                        prep_parts[0] = f"{event_title} in {int(diff_min)} minutes, sir."
+
+                                    # Check if event company is in portfolio
+                                    try:
+                                        from portfolio import DB_PATH as _pdb
+                                        import sqlite3 as _sq3
+                                        if _pdb.exists() and event_title:
+                                            conn = _sq3.connect(str(_pdb))
+                                            tickers = [r[0] for r in conn.execute("SELECT ticker FROM holdings").fetchall()]
+                                            conn.close()
+                                            for ticker in tickers:
+                                                if ticker in event_title.upper():
+                                                    prep_parts.append(f"{ticker} is in your portfolio.")
+                                    except Exception:
+                                        pass
+
+                                    # Check insider sentiment for meeting context
+                                    try:
+                                        ins_f = AI_ADVISERS_MEMORY / "insider_trading_report.json"
+                                        if ins_f.exists():
+                                            ins = json.loads(ins_f.read_text())
+                                            sentiment = ins.get("buy_sell_ratio", {}).get("sentiment", "")
+                                            if sentiment == "BEARISH":
+                                                prep_parts.append("Insiders are broadly selling today — worth knowing.")
+                                    except Exception:
+                                        pass
+
+                                    msg = " ".join(prep_parts)
+                                    alerts.append((key, None, msg))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # Send first alert (one at a time, don't flood)
+            if alerts:
+                key, eid, msg = alerts[0]
+                _proactive_sent[key] = now
+                if eid is not None:
+                    _event_bus_seen.add(eid)
+                tts = strip_markdown_for_tts(msg)
+                try:
+                    await ws.send_json({"type": "status", "state": "speaking"})
+                    audio = await synthesize_speech(tts)
+                    if audio:
+                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                        history.append({"role": "assistant", "content": f"[proactive] {msg}"})
+                        log.info(f"[proactive] {msg}")
+                        await asyncio.sleep(len(audio) / 4000 + 1.5)
+                except Exception:
+                    pass
+                # Fallback: also send macOS notification (visible even if tab is background)
+                try:
+                    from notification_bridge import notify
+                    notify("JARVIS", msg[:200])
+                except Exception:
+                    pass
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.debug(f"Proactive loop error: {e}")
+
+
+async def _trigger_check_loop(ws, history: list):
+    """Background loop: checks conditional triggers every 5 minutes."""
+    await asyncio.sleep(60)  # initial delay
+    while True:
+        try:
+            await asyncio.sleep(300)  # every 5 minutes
+            import trigger_monitor as _tm
+            fired_messages = _tm.check_all()
+            for msg in fired_messages:
+                log.info(f"[trigger] fired: {msg}")
+                tts = strip_markdown_for_tts(msg)
+                audio = await synthesize_speech(tts)
+                try:
+                    await ws.send_json({"type": "trigger_alert", "message": msg})
+                    if audio:
+                        await ws.send_json({"type": "status", "state": "speaking"})
+                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                        history.append({"role": "assistant", "content": f"[trigger] {msg}"})
+                        await asyncio.sleep(len(audio) / 4000 + 1.0)
+                    # Also send macOS notification
+                    from notification_bridge import notify
+                    notify("JARVIS Alert", msg[:200])
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.debug(f"Trigger check loop error: {e}")
+
 
 # Background context cache — never blocks responses
 _ctx_cache = {
@@ -1459,15 +3120,24 @@ async def api_list_projects():
 # -- Fast Action Detection (no LLM call) -----------------------------------
 
 def _scan_projects_sync() -> list[dict]:
-    """Synchronous Desktop scan — runs in executor."""
+    """Synchronous scan — runs in executor. Always includes jarvis first."""
     projects = []
-    desktop = Path.home() / "Desktop"
-    try:
-        for entry in desktop.iterdir():
-            if entry.is_dir() and not entry.name.startswith("."):
-                projects.append({"name": entry.name, "path": str(entry), "branch": ""})
-    except Exception:
-        pass
+    seen = set()
+
+    # Always register jarvis itself
+    jarvis_path = Path(__file__).parent
+    projects.append({"name": "jarvis", "path": str(jarvis_path), "branch": "main"})
+    seen.add(str(jarvis_path))
+
+    for scan_dir in [Path.home() / "Desktop", Path.home()]:
+        try:
+            for entry in sorted(scan_dir.iterdir()):
+                if entry.is_dir() and not entry.name.startswith(".") and str(entry) not in seen:
+                    if (entry / ".git").exists():
+                        seen.add(str(entry))
+                        projects.append({"name": entry.name, "path": str(entry), "branch": ""})
+        except Exception:
+            pass
     return projects
 
 
@@ -1536,6 +3206,28 @@ def detect_action_fast(text: str) -> dict | None:
                              "what's the cost", "whats the cost", "api cost", "token usage",
                              "how expensive", "what's my bill"]):
         return {"action": "check_usage"}
+
+    # Reminders
+    if any(p in t for p in ["my reminders", "what are my reminders", "check my reminders",
+                             "what's on my reminders", "whats on my reminders"]):
+        return {"action": "check_reminders"}
+
+    # Spotify
+    if any(p in t for p in ["what's playing", "whats playing", "now playing", "what song",
+                             "pause spotify", "play spotify", "skip this", "next song",
+                             "spotify status"]):
+        return {"action": "spotify_status"}
+
+    # Market / stocks
+    if any(p in t for p in ["market summary", "market update", "how's the market",
+                             "hows the market", "market today", "stock market", "spy today",
+                             "qqq today", "bitcoin today", "market snapshot"]):
+        return {"action": "market_summary"}
+
+    # Clipboard
+    if any(p in t for p in ["what's in my clipboard", "whats in my clipboard",
+                             "read my clipboard", "what did i copy", "clipboard contents"]):
+        return {"action": "clipboard_read"}
 
     return None  # Everything else goes to the LLM for conversational routing
 
@@ -1719,6 +3411,21 @@ async def _do_screen_lookup() -> str:
     return "Couldn't see the screen, sir."
 
 
+async def _do_reminders_lookup() -> str:
+    reminders = await get_reminders()
+    return format_reminders_for_voice(reminders)
+
+
+async def _do_market_summary_lookup() -> str:
+    summary = await get_market_summary()
+    return format_market_summary_for_voice(summary)
+
+
+async def _do_clipboard_read() -> str:
+    content = await read_clipboard()
+    return format_clipboard_for_voice(content)
+
+
 def get_lookup_status() -> str:
     """Get status of active lookups for when user asks 'how's that coming'."""
     if not _active_lookups:
@@ -1799,7 +3506,7 @@ async def handle_research(text: str, target: str, client: anthropic.AsyncAnthrop
     """Deep research with Opus — write results to HTML, open in browser."""
     try:
         research_response = await client.messages.create(
-            model="claude-opus-4-6",
+            model="claude-opus-4-8",
             max_tokens=2000,
             system=f"You are JARVIS, researching a topic for {USER_NAME}. Be thorough, organized, and cite sources where possible.",
             messages=[{"role": "user", "content": f"Research this thoroughly:\n\n{target}"}],
@@ -1896,7 +3603,6 @@ async def voice_handler(ws: WebSocket):
     """
     await ws.accept()
     task_manager.register_websocket(ws)
-    history: list[dict] = []
     work_session = WorkSession()
     planner = TaskPlanner()
 
@@ -1907,27 +3613,93 @@ async def voice_handler(ws: WebSocket):
     # Audio collision prevention — track when user last spoke
     voice_state = {"last_user_time": 0.0}
 
-    # Self-awareness — track last spoken response to avoid repetition
-    last_jarvis_response = ""
+    # Session persistence — restore prior conversation state if < 24h old
+    try:
+        from session_store import load_session, save_session as _save_session
+        _prior = load_session()
+    except Exception:
+        _prior = None
+
+    if _prior:
+        history: list[dict] = _prior.get("history", [])
+        session_summary: str = _prior.get("session_summary", "")
+        last_jarvis_response: str = _prior.get("last_response", "")
+        log.info(f"Session restored: {len(history)} messages from {_prior.get('date','?')}")
+    else:
+        history: list[dict] = []
+        session_summary: str = ""
+        last_jarvis_response: str = ""
 
     # Three-tier conversation memory
     session_buffer: list[dict] = []  # ALL messages, never truncated
-    session_summary: str = ""  # Rolling summary of older conversation
     summary_update_pending: bool = False
     messages_since_last_summary: int = 0
 
-    log.info("Voice WebSocket connected")
+    global _ws_client_count
+    _ws_client_count += 1
+    log.info(f"Voice WebSocket connected (clients: {_ws_client_count})")
+
+    # Write client count so notification_bridge can check
+    try:
+        Path("/Users/navidavi/jarvis/data").mkdir(exist_ok=True)
+        Path("/Users/navidavi/jarvis/data/ws_clients.json").write_text(f'{{"clients": {_ws_client_count}}}')
+    except Exception:
+        pass
 
     try:
         # ── Greeting — always start in conversation mode ──
         now = datetime.now()
         hour = now.hour
-        if hour < 12:
+        if _prior and len(history) > 2:
+            # Restored prior session — contextual welcome back
+            greeting = "Welcome back, sir." if hour >= 12 else "Good morning again, sir."
+        elif hour < 12:
             greeting = "Good morning, sir."
         elif hour < 17:
             greeting = "Good afternoon, sir."
         else:
             greeting = "Good evening, sir."
+
+        # Calendar-aware context: surface imminent meetings
+        try:
+            _next_evt = get_next_event()
+            if _next_evt:
+                # get_next_event returns a dict with 'title' and 'start' (datetime or string)
+                evt_title = _next_evt.get("title", "")
+                evt_start = _next_evt.get("start")
+                if evt_title and evt_start:
+                    if isinstance(evt_start, str):
+                        try:
+                            from dateutil import parser as _dparser
+                            evt_start = _dparser.parse(evt_start)
+                        except Exception:
+                            evt_start = None
+                    if evt_start:
+                        diff_min = (evt_start - datetime.now()).total_seconds() / 60
+                        if 0 < diff_min <= 30:
+                            greeting += f" You have {evt_title} in {int(diff_min)} minutes, sir."
+                        elif 0 < diff_min <= 90:
+                            greeting += f" {evt_title} is in {int(diff_min)} minutes, sir."
+        except Exception:
+            pass
+
+        # Append morning briefing if available (generated at 8:30AM by morning_briefing.py)
+        try:
+            from morning_briefing import get_briefing as _get_briefing
+            _briefing = _get_briefing()
+            if _briefing:
+                greeting += " " + _briefing
+        except Exception:
+            pass
+
+        # Routine learning — proactive suggestion based on time-of-day patterns
+        try:
+            from routine_learner import suggest_proactive as _suggest
+            _suggestion = _suggest()
+            if _suggestion and not _briefing:  # skip if briefing already said something
+                greeting += " " + _suggestion
+        except Exception:
+            pass
 
         global _last_greeting_time
         should_greet = (time.time() - _last_greeting_time) > 60
@@ -1938,6 +3710,7 @@ async def voice_handler(ws: WebSocket):
             async def _send_greeting():
                 try:
                     await asyncio.sleep(0.5)  # Wait for WS to fully establish
+                    if _mic_listener: _mic_listener.pause()
                     audio_bytes = await synthesize_speech(greeting)
                     if audio_bytes:
                         encoded = base64.b64encode(audio_bytes).decode()
@@ -1946,10 +3719,30 @@ async def voice_handler(ws: WebSocket):
                         history.append({"role": "assistant", "content": greeting})
                         log.info(f"JARVIS: {greeting}")
                         await ws.send_json({"type": "status", "state": "idle"})
+                        # Resume mic after greeting finishes
+                        audio_duration = len(audio_bytes) / 4000
+                        await asyncio.sleep(audio_duration + 1.5)
+                    if _mic_listener: _mic_listener.resume()
                 except Exception as e:
                     log.warning(f"Greeting failed: {e}")
+                    if _mic_listener: _mic_listener.resume()
 
             asyncio.create_task(_send_greeting())
+            asyncio.create_task(_proactive_loop(ws, history))
+            asyncio.create_task(_trigger_check_loop(ws, history))
+            # Passive screen intelligence (only if JARVIS_SCREEN_INTEL=1 in env)
+            try:
+                import screen_intel as _si
+                if _si.is_enabled():
+                    asyncio.create_task(_si.passive_screen_loop(ws, anthropic_client, synthesize_speech, history))
+            except Exception:
+                pass
+            # File system watcher — proactive alerts on new Downloads/Desktop files
+            try:
+                import file_watcher as _fw
+                asyncio.create_task(_fw.start_watcher(ws, synthesize_speech))
+            except Exception:
+                pass
 
         try:
             await ws.send_json({"type": "status", "state": "idle"})
@@ -1961,10 +3754,18 @@ async def voice_handler(ws: WebSocket):
             ws_task  = asyncio.create_task(ws.receive_text())
             mic_task = asyncio.create_task(_transcript_queue.get())
             done, pending = await asyncio.wait(
-                {ws_task, mic_task}, return_when=asyncio.FIRST_COMPLETED
+                {ws_task, mic_task}, return_when=asyncio.FIRST_COMPLETED, timeout=25.0
             )
             for t in pending:
                 t.cancel()
+
+            # Keepalive ping — nothing arrived in 25s, send a ping to prevent browser disconnect
+            if not done:
+                try:
+                    await ws.send_json({"type": "ping"})
+                except Exception:
+                    break
+                continue
 
             if mic_task in done:
                 transcript_text = mic_task.result()
@@ -1975,6 +3776,13 @@ async def voice_handler(ws: WebSocket):
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+
+            # ── Barge-in: user interrupted JARVIS mid-speech ──
+            if msg.get("type") == "barge_in":
+                log.info("Barge-in detected — stopping current audio")
+                await ws.send_json({"type": "barge_in_ack"})
+                await ws.send_json({"type": "status", "state": "listening"})
+                continue
 
             # ── Fix-self: activate work mode in JARVIS repo ──
             if msg.get("type") == "fix_self":
@@ -2023,6 +3831,7 @@ async def voice_handler(ws: WebSocket):
                     cached_projects = []
 
             try:
+                _tts_already_sent = False  # set True when streaming TTS pre-sends audio
                 # ── CHECK FOR MODE SWITCHES ──
                 t_lower = user_text.lower()
 
@@ -2179,18 +3988,107 @@ async def voice_handler(ws: WebSocket):
                             response_text = format_tasks_for_voice(tasks)
                         elif action["action"] == "check_usage":
                             response_text = get_usage_summary()
+                        elif action["action"] == "check_reminders":
+                            response_text = "Checking your reminders now, sir."
+                            asyncio.create_task(_lookup_and_report("reminders", _do_reminders_lookup, ws, history=history, voice_state=voice_state))
+                        elif action["action"] == "spotify_status":
+                            response_text = "Checking Spotify now, sir."
+                            asyncio.create_task(_lookup_and_report("spotify", get_spotify_info, ws, history=history, voice_state=voice_state))
+                        elif action["action"] == "market_summary":
+                            response_text = "Pulling up the markets, sir."
+                            asyncio.create_task(_lookup_and_report("market", _do_market_summary_lookup, ws, history=history, voice_state=voice_state))
+                        elif action["action"] == "clipboard_read":
+                            response_text = "Reading your clipboard, sir."
+                            asyncio.create_task(_lookup_and_report("clipboard", _do_clipboard_read, ws, history=history, voice_state=voice_state))
+                        elif action["action"] == "portfolio_status":
+                            response_text = "Pulling up your portfolio, sir."
+                            asyncio.create_task(_execute_portfolio_status(ws, history, voice_state))
+                        elif action["action"] == "add_holding":
+                            asyncio.create_task(_execute_portfolio_add(action["target"], ws, history, voice_state))
+                            response_text = "Adding that to your portfolio, sir."
+                        elif action["action"] == "remove_holding":
+                            asyncio.create_task(_execute_portfolio_remove(action["target"], ws, history, voice_state))
+                            response_text = "Removed, sir."
+                        elif action["action"] == "home_light":
+                            asyncio.create_task(_execute_home_light(action["target"], ws, history))
+                            response_text = "On it, sir."
+                        elif action["action"] == "home_temp":
+                            asyncio.create_task(_execute_home_temp(action["target"], ws, history))
+                            response_text = "Adjusting temperature, sir."
+                        elif action["action"] == "home_scene":
+                            asyncio.create_task(_execute_home_scene(action["target"], ws, history))
+                            response_text = "Setting the scene, sir."
+                        elif action["action"] in ("sys_volume", "sys_brightness", "sys_mute", "sys_unmute",
+                                                   "sys_launch", "sys_quit", "sys_stats", "sys_lock",
+                                                   "sys_battery", "sys_wifi", "send_imessage"):
+                            asyncio.create_task(_execute_system_action(action["action"], action.get("target", ""), ws, history))
+                            response_text = "On it, sir."
+                        elif action["action"] == "websearch":
+                            asyncio.create_task(_execute_websearch(action.get("target", ""), ws, history))
+                            response_text = "Searching, sir."
+                        elif action["action"] == "query_kb":
+                            asyncio.create_task(_execute_query_kb(action.get("target", ""), ws, history))
+                            response_text = "Querying the knowledge base, sir."
+                        elif action["action"] == "set_trigger":
+                            asyncio.create_task(_execute_set_trigger(action.get("target", ""), ws, history))
+                            response_text = "Setting that watch condition, sir."
+                        elif action["action"] == "list_triggers":
+                            try:
+                                import trigger_monitor as _tm
+                                response_text = _tm.format_triggers_for_voice()
+                            except Exception:
+                                response_text = "Trigger list unavailable, sir."
+                        elif action["action"] == "read_doc":
+                            asyncio.create_task(_execute_read_doc(action.get("target", ""), ws, history))
+                            response_text = "Reading that document, sir."
+                        elif action["action"] == "send_email":
+                            asyncio.create_task(_execute_send_email(action.get("target", ""), ws, history))
+                            response_text = "Sending that email, sir."
                         else:
                             response_text = "Understood, sir."
                     else:
                         if not anthropic_client:
                             response_text = "API key not configured."
                         else:
-                            response_text = await generate_response(
-                                user_text, anthropic_client, task_manager,
-                                cached_projects, history,
-                                last_response=last_jarvis_response,
-                                session_summary=session_summary,
-                            )
+                            # Check response cache first (common/repeatable queries)
+                            try:
+                                import response_cache as _rcache
+                                _cached = _rcache.get(user_text)
+                            except Exception:
+                                _cached = None
+                            if _cached:
+                                log.info("[cache] hit for: %s", user_text[:60])
+                                response_text = _cached
+                                _tts_already_sent = False
+                            else:
+                                # Streaming path — TTS starts on first sentence, not after full response
+                                await ws.send_json({"type": "status", "state": "thinking"})
+                                try:
+                                    response_text = await generate_response_streamed(
+                                        user_text, anthropic_client, task_manager,
+                                        cached_projects, history, ws,
+                                        last_response=last_jarvis_response,
+                                        session_summary=session_summary,
+                                    )
+                                    _tts_already_sent = True
+                                except Exception as _api_err:
+                                    # Ollama offline fallback if Anthropic API fails
+                                    log.warning(f"Anthropic API error, trying Ollama fallback: {_api_err}")
+                                    try:
+                                        import ollama_fallback as _ollama
+                                        if _ollama.is_available():
+                                            response_text = _ollama.generate_simple(user_text, history[-6:])
+                                            log.info("[ollama] fallback response generated")
+                                        else:
+                                            response_text = "I'm having trouble reaching my servers, sir. Please check your connection."
+                                    except Exception:
+                                        response_text = "API unavailable, sir."
+                                    _tts_already_sent = False
+                                # Store cacheable responses
+                                try:
+                                    _rcache.set(user_text, response_text)
+                                except Exception:
+                                    pass
 
                             # Check for action tags embedded in LLM response
                             clean_response, embedded_action = extract_action(response_text)
@@ -2307,6 +4205,56 @@ async def voice_handler(ws: WebSocket):
                                         asyncio.create_task(create_apple_note("JARVIS Note", target))
                                 elif embedded_action["action"] == "screen":
                                     asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
+                                elif embedded_action["action"] == "create_event":
+                                    asyncio.create_task(_execute_create_event(embedded_action["target"], ws, history))
+                                elif embedded_action["action"] == "github":
+                                    asyncio.create_task(_execute_github(embedded_action["target"], ws, history, voice_state))
+                                elif embedded_action["action"] == "reminder":
+                                    asyncio.create_task(_execute_reminder(embedded_action["target"], ws))
+                                elif embedded_action["action"] == "complete_reminder":
+                                    asyncio.create_task(_execute_complete_reminder(embedded_action["target"], ws))
+                                elif embedded_action["action"] == "contact":
+                                    asyncio.create_task(_execute_contact_lookup(embedded_action["target"], ws, history, voice_state))
+                                elif embedded_action["action"] == "spotify":
+                                    asyncio.create_task(_execute_spotify(embedded_action["target"], ws, history, voice_state))
+                                elif embedded_action["action"] == "clipboard_read":
+                                    asyncio.create_task(_lookup_and_report("clipboard", _do_clipboard_read, ws, history=history, voice_state=voice_state))
+                                elif embedded_action["action"] == "clipboard_write":
+                                    asyncio.create_task(_execute_clipboard_write(embedded_action["target"], ws))
+                                elif embedded_action["action"] == "market":
+                                    asyncio.create_task(_execute_market_price(embedded_action["target"], ws, history, voice_state))
+                                elif embedded_action["action"] == "market_summary":
+                                    asyncio.create_task(_lookup_and_report("market", _do_market_summary_lookup, ws, history=history, voice_state=voice_state))
+                                elif embedded_action["action"] == "add_holding":
+                                    asyncio.create_task(_execute_portfolio_add(embedded_action["target"], ws, history, voice_state))
+                                elif embedded_action["action"] == "remove_holding":
+                                    asyncio.create_task(_execute_portfolio_remove(embedded_action["target"], ws, history, voice_state))
+                                elif embedded_action["action"] == "portfolio_status":
+                                    asyncio.create_task(_execute_portfolio_status(ws, history, voice_state))
+                                elif embedded_action["action"] == "home_light":
+                                    asyncio.create_task(_execute_home_light(embedded_action["target"], ws, history))
+                                elif embedded_action["action"] == "home_temp":
+                                    asyncio.create_task(_execute_home_temp(embedded_action["target"], ws, history))
+                                elif embedded_action["action"] == "home_scene":
+                                    asyncio.create_task(_execute_home_scene(embedded_action["target"], ws, history))
+                                elif embedded_action["action"] in ("sys_volume", "sys_brightness", "sys_mute",
+                                                                    "sys_unmute", "sys_launch", "sys_quit",
+                                                                    "sys_stats", "sys_lock", "sys_battery",
+                                                                    "sys_wifi", "send_imessage"):
+                                    asyncio.create_task(_execute_system_action(
+                                        embedded_action["action"], embedded_action.get("target", ""), ws, history))
+                                elif embedded_action["action"] == "websearch":
+                                    asyncio.create_task(_execute_websearch(embedded_action.get("target", ""), ws, history))
+                                elif embedded_action["action"] == "query_kb":
+                                    asyncio.create_task(_execute_query_kb(embedded_action.get("target", ""), ws, history))
+                                elif embedded_action["action"] == "set_trigger":
+                                    asyncio.create_task(_execute_set_trigger(embedded_action.get("target", ""), ws, history))
+                                elif embedded_action["action"] == "read_doc":
+                                    asyncio.create_task(_execute_read_doc(embedded_action.get("target", ""), ws, history))
+                                elif embedded_action["action"] == "send_email":
+                                    asyncio.create_task(_execute_send_email(embedded_action.get("target", ""), ws, history))
+                                elif embedded_action["action"] == "pegasus":
+                                    asyncio.create_task(_execute_pegasus(embedded_action.get("target", "CODE_BLACK"), ws, history))
                                 elif embedded_action["action"] == "read_note":
                                     # Read note in background and report back
                                     async def _read_and_report(search_term, _ws):
@@ -2354,22 +4302,45 @@ async def voice_handler(ws: WebSocket):
                 if anthropic_client and len(user_text) > 15:
                     asyncio.create_task(extract_memories(user_text, response_text, anthropic_client))
 
-                # TTS — pause mic so JARVIS doesn't hear itself
+                # Skip non-speech internal tokens
+                if not response_text or response_text.strip() in ("[listening]", "[thinking]", "[processing]", ""):
+                    if _mic_listener: _mic_listener.resume()
+                    continue
+
+                # TTS — streaming path already sent audio sentence-by-sentence
                 tts = strip_markdown_for_tts(response_text)
                 if _mic_listener: _mic_listener.pause()
-                await ws.send_json({"type": "status", "state": "speaking"})
-                audio = await synthesize_speech(tts)
-                if audio:
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
-                    # Resume mic after estimated audio duration + 0.5s buffer
-                    audio_duration = len(audio) / (16000 * 2)  # approx bytes to seconds
-                    asyncio.create_task(_resume_mic_after(audio_duration + 0.5))
+                if _tts_already_sent:
+                    # Streaming sent all audio chunks — just signal speaking state
+                    # (frontend queued and plays them; we estimate duration for mic resume)
+                    await ws.send_json({"type": "status", "state": "speaking"})
+                    est_duration = len(tts) / 15  # ~15 chars/second speech rate
+                    asyncio.create_task(_resume_mic_after(max(est_duration, 1.5)))
                 else:
-                    await ws.send_json({"type": "text", "text": response_text})
-                    await ws.send_json({"type": "status", "state": "idle"})
-                    if _mic_listener: _mic_listener.resume()
+                    await ws.send_json({"type": "status", "state": "speaking"})
+                    audio = await synthesize_speech(tts)
+                    if audio:
+                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
+                        # MP3 at ~32kbps (edge-tts compressed) → bytes/4000 ≈ seconds
+                        audio_duration = len(audio) / 4000
+                        asyncio.create_task(_resume_mic_after(audio_duration + 1.5))
+                    else:
+                        await ws.send_json({"type": "text", "text": response_text})
+                        await ws.send_json({"type": "status", "state": "idle"})
+                        if _mic_listener: _mic_listener.resume()
                 log.info(f"JARVIS: {response_text}")
                 last_jarvis_response = response_text
+                _log_interaction(user_text, response_text, latency_ms=(time.time() - voice_state["last_user_time"]) * 1000)
+
+                # Auto-learn from corrections — if user is correcting JARVIS, store the correction as a memory
+                _correction_words = {"no ", "wrong", "incorrect", "not right", "that's not", "thats not", "not what i", "actually ", "i meant"}
+                if any(cw in user_text.lower() for cw in _correction_words) and last_jarvis_response:
+                    try:
+                        correction_mem = f"User corrected JARVIS: said '{user_text[:100]}' after JARVIS said '{last_jarvis_response[:80]}'"
+                        remember(correction_mem, mem_type="correction", importance=8)
+                        log.info(f"[auto-learn] Correction stored: {user_text[:60]}")
+                    except Exception:
+                        pass
 
             except Exception as e:
                 log.error(f"Error: {e}", exc_info=True)
@@ -2389,7 +4360,21 @@ async def voice_handler(ws: WebSocket):
     except Exception as e:
         log.error(f"WebSocket error: {e}", exc_info=True)
     finally:
+        _ws_client_count = max(0, _ws_client_count - 1)
+        try:
+            Path("/Users/navidavi/jarvis/data/ws_clients.json").write_text(f'{{"clients": {_ws_client_count}}}')
+        except Exception:
+            pass
+        log.info(f"Voice WebSocket disconnected (clients: {_ws_client_count})")
         task_manager.unregister_websocket(ws)
+        # Save session state for restoration on next connect
+        try:
+            from session_store import save_session as _save_session
+            if history:
+                _save_session(history, session_summary, last_jarvis_response)
+                log.info(f"Session saved: {len(history)} messages")
+        except Exception as e:
+            log.debug(f"Session save failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -2546,6 +4531,94 @@ async def api_save_preferences(body: PreferencesUpdate):
 # ---------------------------------------------------------------------------
 # Control endpoints (restart, fix-self)
 # ---------------------------------------------------------------------------
+
+# Track active WS client count for notification_bridge
+_ws_client_count = 0
+
+@app.post("/api/transcript")
+async def api_transcript(request: Request):
+    """Receive transcript from jarvis_daemon (always-on mic) and process it.
+    Returns audio as base64 for daemon to play via afplay."""
+    try:
+        data = await request.json()
+        text = data.get("text", "").strip()
+        if not text:
+            return {"error": "empty transcript"}
+        log.info(f"[daemon] transcript: {text}")
+        # Put into the shared transcript queue so the active WS session processes it
+        await _transcript_queue.put(text)
+        return {"status": "queued"}
+    except Exception as e:
+        log.error(f"api_transcript error: {e}")
+        return {"error": str(e)}
+
+
+@app.post("/api/siri")
+async def api_siri(request: Request):
+    """iOS Shortcuts bridge — receive text, return spoken response as JSON.
+    iOS Shortcut: POST {"text": "what's my portfolio"} → {"response": "...text..."}
+    """
+    try:
+        data = await request.json()
+        text = data.get("text", "").strip()
+        if not text:
+            return {"response": "No input received, sir."}
+        log.info(f"[siri] query: {text}")
+        # Use generate_response directly (no streaming for Siri)
+        if not anthropic_client:
+            return {"response": "API key not configured."}
+        response = await generate_response(text, anthropic_client, task_manager, cached_projects, [], last_response="")
+        return {"response": response, "text": response}
+    except Exception as e:
+        log.error(f"api_siri error: {e}")
+        return {"response": "Something went wrong, sir.", "error": str(e)}
+
+
+@app.post("/api/notify")
+async def api_notify(request: Request):
+    """Send a macOS notification. Used by iOS, scripts, or external triggers.
+    Body: {"title": "JARVIS", "message": "...", "speak": true}"""
+    try:
+        data = await request.json()
+        title = data.get("title", "JARVIS")
+        message = data.get("message", "")
+        should_speak = data.get("speak", False)
+        if message:
+            try:
+                from notification_bridge import notify, speak_system
+                notify(title, message)
+                if should_speak:
+                    speak_system(message)
+            except Exception as ne:
+                log.warning(f"notification_bridge error: {ne}")
+        return {"status": "sent"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/ws-status")
+async def api_ws_status():
+    """Return number of active WebSocket clients — used by notification_bridge."""
+    return {"clients": _ws_client_count}
+
+
+@app.post("/api/feedback")
+async def api_feedback(request: Request):
+    """Record thumbs-up/down feedback for the last response."""
+    data = await request.json()
+    rating = data.get("rating", 0)   # 1 = thumbs up, -1 = thumbs down
+    text   = data.get("text", "")
+    entry  = {
+        "ts":     datetime.now().isoformat(),
+        "type":   "feedback",
+        "rating": rating,
+        "text":   text,
+    }
+    log_path = DATA_DIR / "interaction_log.jsonl"
+    with open(log_path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    return {"status": "recorded"}
+
 
 @app.post("/api/restart")
 async def api_restart():
