@@ -2228,6 +2228,16 @@ async def synthesize_speech(text: str) -> Optional[bytes]:
         except Exception as e:
             log.error(f"TTS error: {e}")
 
+    # ── Piper (offline neural voice) — when edge-tts can't reach the network ──
+    if not audio:
+        try:
+            from local_tts import synth_wav
+            audio = await asyncio.get_running_loop().run_in_executor(None, synth_wav, text)
+            if audio:
+                log.debug("TTS: Piper offline voice used")
+        except Exception as _pe:
+            log.debug(f"Piper error: {_pe}")
+
     if audio:
         if len(text) < 120:
             _tts_cache[text] = audio
@@ -2236,8 +2246,8 @@ async def synthesize_speech(text: str) -> Optional[bytes]:
     else:
         # ── Tier 3: macOS say command — works 100% offline, no network needed ──
         try:
-            import subprocess as _sp
-            _sp.Popen(["say", "-v", "Daniel", text[:300]])
+            from local_tts import speak as _speak
+            _speak(text[:300])
             log.debug("TTS: macOS say fallback used")
         except Exception:
             pass
@@ -2444,8 +2454,8 @@ async def generate_response_streamed(
         # Final safety net: macOS say if TTS also failed
         elif not audio:
             try:
-                import subprocess as _sp
-                _sp.Popen(["say", "-v", "Daniel", tts_text])
+                from local_tts import speak as _speak
+                _speak(tts_text)
             except Exception:
                 pass
 
