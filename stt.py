@@ -17,14 +17,17 @@ log = logging.getLogger("jarvis.stt")
 SAMPLE_RATE   = 16000
 CHANNELS      = 1
 CHUNK         = 1024
-SILENCE_LIMIT = 1.5   # seconds of silence before sending transcript
-MIN_SPEECH    = 0.4   # minimum seconds of speech to process
+SILENCE_LIMIT = 1.2   # seconds of silence before sending transcript
+MIN_SPEECH    = 0.8   # minimum seconds of speech to process (filters short noise)
 
 _model = None
 
 def _load_model():
     global _model
     if _model is None:
+        import sys
+        # torch 2.2.2 (NumPy-1 build) aborts via duplicate libiomp5 if ctranslate2 loads it
+        sys.modules.setdefault("torch", None)
         from faster_whisper import WhisperModel
         log.info("Loading Whisper tiny model...")
         _model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
@@ -96,7 +99,7 @@ class MicListener:
                 # Energy-based VAD
                 samples = np.frombuffer(data, dtype=np.int16).astype(np.float32)
                 rms = float(np.sqrt(np.mean(samples ** 2)))
-                is_speech = rms > 300  # threshold — adjust if too sensitive
+                is_speech = rms > 600  # higher threshold filters background noise
 
                 if is_speech:
                     speech_frames.append(data)
@@ -133,12 +136,16 @@ class MicListener:
             segments, _ = model.transcribe(buf, language="en", vad_filter=True)
             text = " ".join(s.text.strip() for s in segments).strip()
 
-            if text and len(text) > 1:
+            # Filter out garbage: must be 3+ words or 10+ chars, not single words
+            words = text.split()
+            if text and len(text) >= 8 and len(words) >= 2:
                 log.info(f"Transcript: {text}")
                 if self._loop and self._loop.is_running():
                     asyncio.run_coroutine_threadsafe(
                         self._dispatch(text), self._loop
                     )
+            else:
+                log.debug(f"Filtered short transcript: {text}")
         except Exception as e:
             log.error(f"Transcription error: {e}")
 

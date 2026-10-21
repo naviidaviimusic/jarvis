@@ -11,6 +11,25 @@ JARVIS connects to your Apple Calendar, Mail, and Notes. It can browse the web, 
 <!-- TODO: Add demo GIF or screenshot here -->
 <!-- ![JARVIS Demo](docs/demo.gif) -->
 
+> **This fork** by [Navii](https://github.com/naviidaviimusic) extends Ethan Rogers' original
+> [JARVIS](https://github.com/ethanplusai/jarvis) to keep working **fully offline** and to run your Mac.
+> Original work © Ethan Rogers, used under its non-commercial license.
+
+## What's New in This Fork
+
+| | |
+|---|---|
+| 🧠 **Offline brain** | Falls back to local [Ollama](https://ollama.com) models when the Claude API is unreachable or out of credits (`ollama_fallback.py`) |
+| 👂 **Always-on wake word** | Background daemon: mic → voice-activity detection → local faster-whisper → "Hey JARVIS" (`jarvis_daemon.py`) |
+| 🗣️ **Offline British voice** | Piper `en_GB-alan` neural TTS between edge-tts and macOS `say`, so it never goes silent (`local_tts.py`) |
+| 🎙️ **Local speech-to-text** | Whisper on-device, no Google servers (`stt.py`) |
+| 🖥️ **Mac control** | Volume, brightness, apps, battery, Wi-Fi, lock, iMessage (`system_control.py`) |
+| 📇 **More Apple apps** | Contacts, Reminders, Spotify, clipboard, plus GitHub and Home Assistant |
+| ⏰ **Triggers** | "Alert me when NVDA drops below 500", "remind me at 3pm" (`trigger_monitor.py`) |
+| 📈 **Briefings & portfolio** | Voice-ready morning brief and holdings P&L (`morning_briefing.py`, `portfolio.py`) |
+| 🔁 **Learns your routine** | Time-of-day patterns pre-warm answers; weekly self-review (`routine_learner.py`, `jarvis_self_improve.py`) |
+| 🛎️ **Works with the browser closed** | macOS notifications + spoken fallback (`notification_bridge.py`) |
+
 ---
 
 ## What It Does
@@ -187,7 +206,7 @@ Free for personal, non-commercial use. Commercial use requires a license — vis
 
 ## Credits
 
-Built by [Ethan](https://ethanplus.ai).
+Built by [Ethan](https://ethanplus.ai). Offline/macOS extensions by [Navii](https://github.com/naviidaviimusic).
 
 Powered by [Anthropic Claude](https://anthropic.com) and [Fish Audio](https://fish.audio).
 

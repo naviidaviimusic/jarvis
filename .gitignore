@@ -39,3 +39,11 @@ desktop-overlay/node_modules/
 context/
 *.db-shm
 *.db-wal
+
+# Runtime state / personal output (never commit)
+data/*.json
+data/*.txt
+logs/
+reports/
+*.bak*
+*.bak_*

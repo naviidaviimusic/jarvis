@@ -44,7 +44,10 @@ tell application "Notes"
         set n to item i of allNotes
         set nName to name of n
         set nDate to creation date of n as string
-        set nFolder to name of container of n
+        set nFolder to "Notes"
+        try
+            set nFolder to name of container of n
+        end try
         set output to output & nName & "|||" & nDate & "|||" & nFolder & linefeed
     end repeat
     return output

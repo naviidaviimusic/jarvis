@@ -17,32 +17,67 @@ When a user clones this repo and starts Claude Code, help them:
 10. Click to enable audio, speak to JARVIS
 
 ## Architecture
-- **Backend**: FastAPI + Python (server.py, ~2300 lines)
-- **Frontend**: Vite + TypeScript + Three.js (audio-reactive orb)
-- **Communication**: WebSocket (JSON messages + binary audio)
-- **AI**: Claude Haiku for fast responses, Claude Opus for research
-- **TTS**: Fish Audio with JARVIS voice model
-- **System**: AppleScript for Calendar, Mail, Notes, Terminal integration
+- **Backend**: FastAPI + Python (server.py, ~4200+ lines)
+- **Frontend**: Vite + TypeScript + Three.js (audio-reactive orb, barge-in support)
+- **Communication**: WebSocket (JSON messages + binary audio) + HTTP REST
+- **AI**: Claude Sonnet/Opus via Anthropic SDK, streaming TTS sentence-by-sentence
+- **TTS**: edge-tts (en-GB-RyanNeural) — British voice
+- **STT**: Chrome Web Speech API (browser) + always-on Whisper daemon (background)
+- **System**: AppleScript for Calendar, Mail, Notes, Terminal + system_control.py
 
 ## Key Files
-- `server.py` — Main server, WebSocket handler, LLM integration, action system
+### Core
+- `server.py` — Main server, WebSocket handler, LLM integration, all action dispatch
 - `frontend/src/orb.ts` — Three.js particle orb visualization
-- `frontend/src/voice.ts` — Web Speech API + audio playback
-- `frontend/src/main.ts` — Frontend state machine
-- `memory.py` — SQLite memory system with FTS5 search
-- `calendar_access.py` — Apple Calendar integration via AppleScript
-- `mail_access.py` — Apple Mail integration (READ-ONLY)
-- `notes_access.py` — Apple Notes integration
-- `actions.py` — System actions (Terminal, Chrome, Claude Code)
-- `browser.py` — Playwright web automation
-- `work_mode.py` — Persistent Claude Code sessions
+- `frontend/src/voice.ts` — Web Speech API + barge-in + AudioContext audio player
+- `frontend/src/main.ts` — Frontend state machine (idle/listening/thinking/speaking)
+- `memory.py` — SQLite memory system with FTS5 search, tasks, notes
+- `session_store.py` — Cross-restart session persistence (30 messages)
+- `response_cache.py` — 5-min TTL cache for common queries
+
+### Intelligence
+- `portfolio.py` — Personal holdings tracker with AI Advisers signal cross-reference
+- `morning_briefing.py` — Daily 8:30AM voice-ready market briefing
+- `jarvis_self_improve.py` — Weekly self-improvement from interaction log (Sundays 6AM)
+- `jarvis_daily_agent.py` — Daily evolution agent (6AM) — audits capabilities, writes reports/
+
+### System Control
+- `system_control.py` — Volume, brightness, apps, stats, lock, battery, WiFi, iMessage
+- `home_control.py` — Home Assistant smart home (needs HOME_ASSISTANT_URL in .env)
+- `notification_bridge.py` — macOS notifications + system TTS fallback when browser closed
+- `file_watcher.py` — watchdog on ~/Downloads + ~/Desktop, proactive file alerts
+- `screen_intel.py` — Passive screenshot analysis (needs JARVIS_SCREEN_INTEL=1)
+- `jarvis_daemon.py` — **Always-on wake word daemon** (LaunchAgent, KeepAlive)
+
+### macOS Integrations
+- `calendar_access.py`, `mail_access.py` (READ-ONLY), `notes_access.py`
+- `contacts_access.py`, `reminders_access.py`, `spotify_access.py`, `clipboard_access.py`
+- `github_access.py`, `actions.py`, `browser.py`, `work_mode.py`
 
 ## Environment Variables
 - `ANTHROPIC_API_KEY` (required) — Claude API access
-- `FISH_API_KEY` (required) — Fish Audio TTS
-- `FISH_VOICE_ID` (optional) — Voice model ID
 - `USER_NAME` (optional) — Your name for JARVIS to use
 - `CALENDAR_ACCOUNTS` (optional) — Comma-separated calendar emails
+- `HOME_ASSISTANT_URL` + `HOME_ASSISTANT_TOKEN` (optional) — Smart home control
+- `JARVIS_SCREEN_INTEL=1` (optional) — Enable passive screenshot analysis
+
+## LaunchAgents
+- `com.jarvis.daemon` — Always-on wake word listener (starts at login, auto-restarts)
+- `com.jarvis.self_improve` — Sundays 6AM self-improvement analysis
+
+## Action Tags
+All [ACTION:X] tags JARVIS can emit:
+BUILD, BROWSE, RESEARCH, OPEN_TERMINAL, PROMPT_PROJECT, ADD_TASK, ADD_NOTE,
+COMPLETE_TASK, REMEMBER, CREATE_NOTE, READ_NOTE, SCREEN, CREATE_EVENT, GITHUB,
+REMINDER, COMPLETE_REMINDER, CONTACT, SPOTIFY, CLIPBOARD_READ, CLIPBOARD_WRITE,
+MARKET, MARKET_SUMMARY, ADD_HOLDING, REMOVE_HOLDING, PORTFOLIO_STATUS,
+HOME_LIGHT, HOME_TEMP, HOME_SCENE,
+SYS_VOLUME, SYS_BRIGHTNESS, SYS_LAUNCH, SYS_QUIT, SYS_STATS, SYS_LOCK,
+SYS_MUTE, SYS_UNMUTE, SYS_BATTERY, SYS_WIFI, SEND_IMESSAGE
+
+## iOS Shortcuts Bridge
+POST `http://MAC_IP:8000/api/siri` with `{"text": "your query"}` → `{"response": "..."}`.
+Works from iPhone Shortcuts app, Apple Watch, CarPlay.
 
 ## Conventions
 - JARVIS personality: British butler, dry wit, economy of language
@@ -51,3 +86,18 @@ When a user clones this repo and starts Claude Code, help them:
 - AppleScript for all macOS integrations (no OAuth needed)
 - Read-only for Mail (safety by design)
 - SQLite for all local data storage
+- Python: always use `/usr/local/bin/python3.11`
+
+# Ideas Tracking
+
+At the **start of every conversation**, check if `.claude/ideas.md` exists in this project. If it does:
+1. Read it silently
+2. If any open ideas are relevant to what the user is about to work on, mention them naturally (e.g. "By the way, you had an idea about X — want to tackle that too?")
+3. If no ideas are relevant, don't mention them unless the user has no clear task yet — then suggest picking one up
+
+After **completing a task**, check the ideas list again:
+1. If any open ideas relate to what was just finished, suggest picking one up next
+2. If you realize an open idea was just implemented as part of the work, mark it done in `.claude/ideas.md` and mention it
+3. Otherwise, briefly remind the user they have open ideas if they seem to be wrapping up
+
+Use `/ideas` to capture new ideas mid-session without interrupting flow.

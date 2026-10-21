@@ -11,6 +11,7 @@ export interface VoiceInput {
   stop(): void;
   pause(): void;
   resume(): void;
+  setBargeInMode(enabled: boolean): void;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -18,18 +19,20 @@ declare const webkitSpeechRecognition: any;
 
 export function createVoiceInput(
   onTranscript: (text: string) => void,
-  onError: (msg: string) => void
+  onError: (msg: string) => void,
+  onBargeIn?: () => void,
 ): VoiceInput {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const SR = (window as any).SpeechRecognition || (typeof webkitSpeechRecognition !== "undefined" ? webkitSpeechRecognition : null);
   if (!SR) {
     onError("Speech recognition not supported in this browser");
-    return { start() {}, stop() {}, pause() {}, resume() {} };
+    return { start() {}, stop() {}, pause() {}, resume() {}, setBargeInMode() {} };
   }
 
   let recognition = new SR();
   let shouldListen = false;
   let paused = false;
+  let bargeInMode = false;  // keep listening while speaking, fire onBargeIn instead
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
 
   function configureRecognition() {
@@ -41,7 +44,15 @@ export function createVoiceInput(
       for (let i = event.resultIndex; i < event.results.length; i++) {
         if (event.results[i].isFinal) {
           const text = event.results[i][0].transcript.trim();
-          if (text) onTranscript(text);
+          if (!text) continue;
+          if (bargeInMode && onBargeIn) {
+            // Interrupt JARVIS mid-speech — fire barge-in then deliver transcript
+            onBargeIn();
+            bargeInMode = false;
+            setTimeout(() => onTranscript(text), 200);
+          } else {
+            onTranscript(text);
+          }
         }
       }
     };
@@ -107,18 +118,29 @@ export function createVoiceInput(
       try { recognition.stop(); } catch { /* ignore */ }
     },
     pause() {
+      // In barge-in mode, keep listening — don't actually pause
+      if (bargeInMode) return;
       paused = true;
       if (restartTimer) { clearTimeout(restartTimer); restartTimer = null; }
       try { recognition.stop(); } catch { /* ignore */ }
     },
     resume() {
       paused = false;
+      bargeInMode = false;
       if (shouldListen) {
         try {
           recognition.start();
         } catch {
           scheduleRestart(100);
         }
+      }
+    },
+    setBargeInMode(enabled: boolean) {
+      bargeInMode = enabled;
+      if (enabled && shouldListen && paused) {
+        // Re-enable listening so we can detect barge-in
+        paused = false;
+        try { recognition.start(); } catch { scheduleRestart(100); }
       }
     },
   };

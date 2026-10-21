@@ -18,7 +18,7 @@ fest_tracking: true
 
 **Primary Goal:** Ingest and structure input materials into actionable specifications
 
-**Context:** AI-Advisers codebase at /Users/navidavi/Documents/AI-Advisers
+**Context:** AI-Advisers codebase at ~/Documents/AI-Advisers
 
 ## Input Sources
 

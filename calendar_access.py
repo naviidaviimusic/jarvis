@@ -242,6 +242,57 @@ def format_events_for_context(events: list[dict]) -> str:
     return "\n".join(lines)
 
 
+async def create_calendar_event(
+    title: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    location: str = "",
+    calendar_name: str | None = None,
+    notes: str = "",
+) -> bool:
+    """Create a new event in Apple Calendar via AppleScript."""
+    await _ensure_calendar_running()
+
+    cal_name = calendar_name or (USER_CALENDARS[0] if USER_CALENDARS else "Calendar")
+
+    def _as_date(dt: datetime) -> str:
+        return dt.strftime("%B %d, %Y at %I:%M:%S %p")
+
+    escaped_title = title.replace('"', '\\"')
+    escaped_cal = cal_name.replace('"', '\\"')
+    start_str = _as_date(start_dt)
+    end_str = _as_date(end_dt)
+
+    props = f'summary:"{escaped_title}", start date:date "{start_str}", end date:date "{end_str}"'
+    if location:
+        props += f', location:"{location.replace(chr(34), chr(92)+chr(34))}"'
+    if notes:
+        props += f', description:"{notes.replace(chr(34), chr(92)+chr(34))}"'
+
+    script = f'''
+tell application "Calendar"
+    tell calendar "{escaped_cal}"
+        make new event with properties {{{props}}}
+    end tell
+end tell'''
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=12)
+        if proc.returncode != 0:
+            log.warning(f"create_calendar_event failed: {stderr.decode()[:200]}")
+            return False
+        log.info(f"Calendar event created: {title} at {start_dt}")
+        return True
+    except Exception as e:
+        log.warning(f"create_calendar_event error: {e}")
+        return False
+
+
 def format_schedule_summary(events: list[dict]) -> str:
     """Format a brief voice-friendly summary of the schedule."""
     if not events:
