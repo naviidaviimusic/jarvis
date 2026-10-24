@@ -48,7 +48,7 @@ class QAAgent:
             process = await asyncio.create_subprocess_exec(
                 "claude", "-p",
                 "--output-format", "text",
-                "--dangerously-skip-permissions",
+                "--permission-mode", "acceptEdits",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -136,7 +136,7 @@ class QAAgent:
             process = await asyncio.create_subprocess_exec(
                 "claude", "-p",
                 "--output-format", "text",
-                "--dangerously-skip-permissions",
+                "--permission-mode", "acceptEdits",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
