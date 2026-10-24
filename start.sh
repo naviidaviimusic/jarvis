@@ -18,7 +18,11 @@ if [ ! -f cert.pem ] || [ ! -f key.pem ]; then
 fi
 
 # Start backend
-echo "[backend] Starting on https://localhost:8000 ..."
+echo "[backend] Starting on https://localhost:8340 ..."
+if launchctl list com.jarvis.server >/dev/null 2>&1; then
+    echo "[backend] com.jarvis.server LaunchAgent is running it already — open https://localhost:8340"
+    exit 0
+fi
 python3.11 server.py &
 BACKEND_PID=$!
 echo "[backend] PID $BACKEND_PID"

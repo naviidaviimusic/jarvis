@@ -55,14 +55,19 @@ When a user clones this repo and starts Claude Code, help them:
 - `github_access.py`, `actions.py`, `browser.py`, `work_mode.py`
 
 ## Environment Variables
-- `ANTHROPIC_API_KEY` (required) — Claude API access
+- `ANTHROPIC_API_KEY` (optional) — Claude API access. Without it (or with no credits) JARVIS runs free on the local Ollama brain (`ollama_fallback.py`: gemma3:4b for voice, qwen2.5:7b for reports)
+- `JARVIS_SERVER_MIC=0` — server's own Whisper mic off (set in com.jarvis.server; the wake-word daemon owns the mic)
+- `JARVIS_VOICE_MODEL` / `JARVIS_DEEP_MODEL` (optional) — override the local models
 - `USER_NAME` (optional) — Your name for JARVIS to use
 - `CALENDAR_ACCOUNTS` (optional) — Comma-separated calendar emails
 - `HOME_ASSISTANT_URL` + `HOME_ASSISTANT_TOKEN` (optional) — Smart home control
 - `JARVIS_SCREEN_INTEL=1` (optional) — Enable passive screenshot analysis
 
 ## LaunchAgents
-- `com.jarvis.daemon` — Always-on wake word listener (starts at login, auto-restarts)
+- `com.jarvis.server` — server.py on https://localhost:8340 (UI + API), starts at login, KeepAlive; logs/server.log. Restart: `launchctl kickstart -k gui/$(id -u)/com.jarvis.server`
+- `com.jarvis.daemon` — Always-on wake word listener (starts at login, auto-restarts); posts to https://localhost:8340/api/transcript — answered headless (spoken via afplay) when no browser tab is open
+- `com.jarvis.daily_evolution` — 6AM evolution report (Claude, or the free local brain)
+- Both always-on agents are watched by AI-Advisers `ecosystem_fixer.py` (restart if down / health check fails)
 - `com.jarvis.self_improve` — Sundays 6AM self-improvement analysis
 
 ## Action Tags
@@ -76,7 +81,7 @@ SYS_VOLUME, SYS_BRIGHTNESS, SYS_LAUNCH, SYS_QUIT, SYS_STATS, SYS_LOCK,
 SYS_MUTE, SYS_UNMUTE, SYS_BATTERY, SYS_WIFI, SEND_IMESSAGE
 
 ## iOS Shortcuts Bridge
-POST `http://MAC_IP:8000/api/siri` with `{"text": "your query"}` → `{"response": "..."}`.
+POST `https://MAC_IP:8340/api/siri` with `{"text": "your query"}` → `{"response": "..."}`.
 Works from iPhone Shortcuts app, Apple Watch, CarPlay.
 
 ## Conventions
