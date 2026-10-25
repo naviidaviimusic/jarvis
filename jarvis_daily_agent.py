@@ -25,6 +25,8 @@ from pathlib import Path
 import anthropic
 import httpx
 
+import jarvis_metrics
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [jarvis_agent] %(message)s")
 log = logging.getLogger("jarvis_agent")
 
@@ -139,6 +141,20 @@ capabilities they haven't imagined yet.
 ## JARVIS Current State
 {server_summary}
 
+## Measured Health (from JARVIS's own logs — ground every score in these numbers)
+{measured_health}
+
+## Real Modules (the ONLY files that exist — never invent file names)
+{real_modules}
+
+## Real Action Tags (the ONLY [ACTION:X] commands that exist; a new one must be marked NEW)
+{real_actions}
+
+RULES: Base the audit scores on the measured numbers above, and quote the number behind each
+score. If a dimension has no data, write "no data" instead of a score. Every upgrade's "How"
+must name a file from Real Modules (or say "new file: <name>.py") and should fix a measured
+problem first (failures, slow replies, errors, daemon delivery problems).
+
 ## Today's Market Intelligence (from AI Advisers)
 {market_intel}
 
@@ -225,6 +241,10 @@ def _ollama_generate(prompt: str, model: str = None) -> str:
 
 def run_evolution_analysis(client: "anthropic.Anthropic | None") -> str:
     server_summary = _read_jarvis_server_summary()
+    try:
+        measured_health = jarvis_metrics.build_summary()
+    except Exception as e:
+        measured_health = f"(metrics unavailable: {e})"
     market_intel   = _read_market_intel()
     hn_stories     = _fetch_hn_ai_top()
     prior_reports  = _read_recent_evolution_reports()
@@ -232,6 +252,9 @@ def run_evolution_analysis(client: "anthropic.Anthropic | None") -> str:
 
     prompt = EVOLUTION_PROMPT.format(
         server_summary=server_summary,
+        measured_health=measured_health,
+        real_modules=", ".join(jarvis_metrics.real_modules()),
+        real_actions=", ".join(jarvis_metrics.real_action_tags()),
         market_intel=market_intel,
         hn_stories=hn_stories,
         prior_reports=prior_reports,

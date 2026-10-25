@@ -2152,6 +2152,20 @@ _fish_unavailable: bool = False       # set True on 402/401/403 to skip Fish Aud
 _anthropic_unavailable: bool = False  # set True on credit/auth errors to route to Ollama
 
 
+_ACK_PHRASES = ("One moment, sir.", "Right away, sir.", "Give me a moment, sir.",
+                "Working on it, sir.", "Let me think on that, sir.")
+
+
+def _ack_phrase() -> str:
+    """Instant spoken acknowledgement while the slow local brain thinks."""
+    import random
+    return random.choice(_ACK_PHRASES)
+
+
+def _local_brain_active() -> bool:
+    return anthropic_client is None or _anthropic_unavailable
+
+
 def _disable_anthropic():
     """Drop the client after a credit/auth failure so background summaries and
     memory extraction (all gated on `anthropic_client`) stop retrying Claude."""
@@ -2500,6 +2514,7 @@ async def generate_response_streamed(
     # ── If Anthropic is known-unavailable, go straight to Ollama ──
     if _anthropic_unavailable:
         try:
+            await _flush_sentence(_ack_phrase())
             full_text = await _local_brain_reply(text, conversation_history[-6:])
             if full_text:
                     await _flush_sentence(full_text)
@@ -2561,6 +2576,7 @@ async def generate_response_streamed(
             ollama_done = False
             try:
                 log.info("[ollama] falling back to local LLM")
+                await _flush_sentence(_ack_phrase())
                 full_text = await _local_brain_reply(text, conversation_history[-6:])
                 if full_text:
                     await _flush_sentence(full_text)
@@ -2677,7 +2693,8 @@ def get_usage_summary() -> str:
 
 _INTERACTION_LOG = Path(__file__).parent / "data" / "interaction_log.jsonl"
 
-def _log_interaction(user_text: str, response_text: str, latency_ms: float = 0):
+def _log_interaction(user_text: str, response_text: str, latency_ms: float = 0,
+                     channel: str = "browser"):
     """Append one interaction to the log. Non-blocking — called from asyncio task."""
     try:
         _INTERACTION_LOG.parent.mkdir(exist_ok=True)
@@ -2686,6 +2703,8 @@ def _log_interaction(user_text: str, response_text: str, latency_ms: float = 0):
             "user": user_text[:300],
             "jarvis": response_text[:500],
             "latency_ms": round(latency_ms),
+            "channel": channel,
+            "brain": "local" if _local_brain_active() else "claude",
         }
         with open(_INTERACTION_LOG, "a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -4596,6 +4615,13 @@ async def api_transcript(request: Request):
             return {"status": "queued"}
 
         # Headless (no browser open): answer here and hand the daemon audio to play
+        t0 = time.time()
+        if _local_brain_active():
+            try:
+                from local_tts import speak as _speak
+                _speak(_ack_phrase())  # non-blocking; the daemon is waiting on us, not listening
+            except Exception:
+                pass
         reply = await generate_response(text, anthropic_client, task_manager, cached_projects,
                                         _headless_history[-10:], last_response="")
         reply, _action = extract_action(reply)
@@ -4604,6 +4630,7 @@ async def api_transcript(request: Request):
                                   {"role": "assistant", "content": reply}])
         del _headless_history[:-20]
         log.info(f"[daemon] reply: {reply[:120]}")
+        _log_interaction(text, reply, latency_ms=(time.time() - t0) * 1000, channel="daemon")
         audio = await synthesize_speech(strip_markdown_for_tts(reply))
         if not audio:
             return {"status": "answered", "text": reply}
@@ -4628,10 +4655,12 @@ async def api_siri(request: Request):
             return {"response": "No input received, sir."}
         log.info(f"[siri] query: {text}")
         # Use generate_response directly (no streaming for Siri)
+        t0 = time.time()
         if not anthropic_client or _anthropic_unavailable:
             response = await _local_brain_reply(text, [])
         else:
             response = await generate_response(text, anthropic_client, task_manager, cached_projects, [], last_response="")
+        _log_interaction(text, response, latency_ms=(time.time() - t0) * 1000, channel="siri")
         return {"response": response, "text": response}
     except Exception as e:
         log.error(f"api_siri error: {e}")
