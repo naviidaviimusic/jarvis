@@ -16,12 +16,20 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
 from typing import Optional
 
 log = logging.getLogger("jarvis.ollama_fallback")
 
 OLLAMA_BASE = "http://localhost:11434"
+# Generations go through the shared queue (AI-Advisers/llm_gate.py) so JARVIS waits its turn
+# with the fleet and while RAM is short; the voice server and daemon go to the front.
+# If the gate isn't running, JARVIS talks to Ollama directly as before.
+LLM_GATE = "http://127.0.0.1:11435"
+_ME = os.path.basename(sys.argv[0] or "jarvis")
+GATE_HEADERS = {"X-LLM-Label": f"jarvis {_ME}",
+                "X-LLM-Priority": "interactive" if _ME in ("server.py", "jarvis_daemon.py") else "background"}
 OLLAMA_AGENT = "com.ai-advisers.ollama_server"
 
 # Voice: answer in seconds on CPU. Ollama runs ONE request per model at a time
@@ -176,7 +184,12 @@ def _generate_raw(prompt: str, system: str = "", max_tokens: int = 200,
         # (a long report prompt on 7B/CPU can take minutes before token one)
         read_s = deadline_s if deep else min(deadline_s, 120.0)
         with httpx.Client(timeout=httpx.Timeout(10.0, read=read_s)) as client:
-            with client.stream("POST", f"{OLLAMA_BASE}/api/generate", json=payload) as resp:
+            try:
+                client.get(f"{LLM_GATE}/api/version", timeout=2)
+                url, hdrs = f"{LLM_GATE}/api/generate", GATE_HEADERS
+            except httpx.HTTPError:
+                url, hdrs = f"{OLLAMA_BASE}/api/generate", {}
+            with client.stream("POST", url, json=payload, headers=hdrs) as resp:
                 resp.raise_for_status()
                 for line in resp.iter_lines():
                     if not line:
