@@ -158,7 +158,7 @@ async def open_claude_in_project(project_dir: str, prompt: str) -> dict:
     """Open Terminal, cd to project dir, run Claude Code interactively.
 
     Writes the prompt to CLAUDE.md (which claude reads automatically on startup)
-    then launches claude in interactive mode with --dangerously-skip-permissions.
+    then launches claude in interactive mode (normal permission prompts).
     No prompt escaping needed — CLAUDE.md handles context delivery.
     """
     # Write prompt to CLAUDE.md — claude reads this automatically
@@ -169,7 +169,7 @@ async def open_claude_in_project(project_dir: str, prompt: str) -> dict:
     script = (
         'tell application "Terminal"\n'
         "    activate\n"
-        f'    do script "cd {project_dir} && claude --dangerously-skip-permissions"\n'
+        f'    do script "cd {project_dir} && claude"\n'
         "end tell"
     )
     proc = await asyncio.create_subprocess_exec(
@@ -345,7 +345,7 @@ async def execute_action(intent: dict, projects: list = None) -> dict:
     target = intent.get("target", "")
 
     if action == "open_terminal":
-        result = await open_terminal("claude --dangerously-skip-permissions")
+        result = await open_terminal("claude")
         result["project_dir"] = None
         return result
 

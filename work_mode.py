@@ -68,7 +68,7 @@ class WorkSession:
         cmd = [
             claude_path, "-p",
             "--output-format", "text",
-            "--dangerously-skip-permissions",
+            "--permission-mode", "acceptEdits",
         ]
 
         # Use --continue for subsequent messages to maintain context

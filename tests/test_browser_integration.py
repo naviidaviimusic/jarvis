@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -160,15 +161,29 @@ async def test_browser_research(browser):
 # ── Action Detection ─────────────────────────────────────────────────
 
 
-def test_browse_action_keywords():
-    """Action keywords include browse-related terms."""
-    from server import ACTION_KEYWORDS
+@pytest.mark.asyncio
+async def test_browse_search_phrases_become_a_google_search():
+    """Spoken lead-ins ("search for", "look up", "google") are stripped before searching.
+    (The old ACTION_KEYWORDS table was replaced by the intent classifier.)"""
+    import server
 
-    assert "browse" in ACTION_KEYWORDS
-    browse_keywords = ACTION_KEYWORDS["browse"]
-    assert "search for" in browse_keywords
-    assert "look up" in browse_keywords
-    assert "google" in browse_keywords
+    for spoken in ("search for jazz chord voicings", "look up jazz chord voicings",
+                   "google jazz chord voicings"):
+        with patch.object(server, "open_browser", new=AsyncMock()) as opened:
+            reply = await server.handle_browse(spoken, spoken)
+        url, browser = opened.await_args.args
+        assert url == "https://www.google.com/search?q=jazz%20chord%20voicings", spoken
+        assert browser == "chrome"
+        assert "Searching" in reply
+
+
+@pytest.mark.asyncio
+async def test_browse_spoken_domain_opens_directly():
+    import server
+
+    with patch.object(server, "open_browser", new=AsyncMock()) as opened:
+        await server.handle_browse("open github.com please", "github.com")
+    assert opened.await_args.args[0] == "https://github.com"
 
 
 # ── Browser Lifecycle ─────────────────────────────────────────────────

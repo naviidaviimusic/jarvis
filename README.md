@@ -79,7 +79,8 @@ cd jarvis
 cp .env.example .env
 # Edit .env with your API keys (see below)
 
-# 3. Install Python dependencies
+# 3. Install Python dependencies (PyAudio needs PortAudio first)
+brew install portaudio
 pip install -r requirements.txt
 
 # 4. Install frontend dependencies

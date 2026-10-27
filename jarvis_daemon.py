@@ -4,7 +4,7 @@ JARVIS Wake Word Daemon
 ─────────────────────────
 Always-on background listener. Captures mic with pyaudio, runs VAD,
 transcribes with faster-whisper, detects "jarvis" wake word,
-POSTs transcript to http://localhost:8000/api/transcript.
+POSTs transcript to https://localhost:8340/api/transcript (self-signed local cert).
 Plays TTS response via afplay (server returns audio file path or base64).
 """
 
@@ -25,6 +25,9 @@ sys.modules["torch"] = None
 import numpy as np
 import pyaudio
 import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # localhost self-signed cert
 from faster_whisper import WhisperModel
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
@@ -50,7 +53,8 @@ MAX_RECORD_S = 15.0             # hard cap — a voice command never needs longe
 MAX_RECORD_CHUNKS = int(MAX_RECORD_S * RATE / CHUNK)  # stops music/noise runaways
 
 # ─── Behaviour ────────────────────────────────────────────────────────────────
-SERVER_URL = "http://localhost:8000/api/transcript"
+SERVER_URL = os.environ.get("JARVIS_SERVER_URL", "https://localhost:8340/api/transcript")
+POST_TIMEOUT_S = 120            # headless replies come from the local CPU brain
 POST_RETRIES = 3
 POST_RETRY_DELAY_S = 1.0
 COOLDOWN_S = 2.0                # silence after playback to prevent echo
@@ -123,9 +127,12 @@ def post_transcript(text: str) -> dict | None:
     payload = {"text": text, "source": "daemon"}
     for attempt in range(1, POST_RETRIES + 1):
         try:
-            resp = requests.post(SERVER_URL, json=payload, timeout=10)
+            resp = requests.post(SERVER_URL, json=payload, timeout=POST_TIMEOUT_S, verify=False)
             resp.raise_for_status()
             return resp.json()
+        except requests.exceptions.ReadTimeout:
+            log.warning("Server took >%ss to answer — not resending the command", POST_TIMEOUT_S)
+            return None
         except requests.exceptions.ConnectionError:
             log.warning("Server down (attempt %d/%d) — retrying in %ss",
                         attempt, POST_RETRIES, POST_RETRY_DELAY_S)

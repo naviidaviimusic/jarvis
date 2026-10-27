@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -954,7 +955,7 @@ class ClaudeTaskManager:
         applescript = f'''
         tell application "Terminal"
             activate
-            set newTab to do script "cd {work_dir} && cat .jarvis_prompt.md | claude -p --dangerously-skip-permissions | tee .jarvis_output.txt; echo '\\n--- JARVIS TASK COMPLETE ---'"
+            set newTab to do script "cd {work_dir} && cat .jarvis_prompt.md | claude -p --permission-mode acceptEdits | tee .jarvis_output.txt; echo '\\n--- JARVIS TASK COMPLETE ---'"
         end tell
         '''
 
@@ -1037,31 +1038,14 @@ class ClaudeTaskManager:
                     })
             else:
                 log.warning(f"Task {task.id} failed QA: {qa_result.issues}")
-                if attempt < 3:
-                    log.info(f"Auto-retrying task {task.id} (attempt {attempt + 1}/3)")
-                    retry_result = await qa_agent.auto_retry(
-                        task.prompt, qa_result.issues, task.working_dir, attempt,
-                    )
-                    if retry_result["status"] == "completed":
-                        task.result = retry_result["result"]
-                        # Re-verify
-                        await self._run_qa(task, attempt + 1)
-                    else:
-                        success_tracker.log_task("dev", task.prompt, False, attempt, duration)
-                        await self._notify({
-                            "type": "qa_result",
-                            "task_id": task.id,
-                            "passed": False,
-                            "summary": f"Failed after {attempt + 1} attempts: {qa_result.issues}",
-                        })
-                else:
-                    success_tracker.log_task("dev", task.prompt, False, attempt, duration)
-                    await self._notify({
-                        "type": "qa_result",
-                        "task_id": task.id,
-                        "passed": False,
-                        "summary": f"Failed QA after {attempt} attempts: {qa_result.issues}",
-                    })
+                # No auto-retry: Claude only runs when the user asks. Report and let them decide.
+                success_tracker.log_task("dev", task.prompt, False, attempt, duration)
+                await self._notify({
+                    "type": "qa_result",
+                    "task_id": task.id,
+                    "passed": False,
+                    "summary": f"Failed QA: {qa_result.issues}. Say 'retry' if you want Claude to try again.",
+                })
         except Exception as e:
             log.error(f"QA error for task {task.id}: {e}")
 
@@ -1359,7 +1343,7 @@ async def _execute_research(target: str, ws=None):
         log.info(f"Research started via claude -p in {path}")
 
         process = await asyncio.create_subprocess_exec(
-            "claude", "-p", "--output-format", "text", "--dangerously-skip-permissions",
+            "claude", "-p", "--output-format", "text", "--permission-mode", "acceptEdits",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -2167,6 +2151,61 @@ _tts_cache: dict[str, bytes] = {}
 _fish_unavailable: bool = False       # set True on 402/401/403 to skip Fish Audio for session
 _anthropic_unavailable: bool = False  # set True on credit/auth errors to route to Ollama
 
+
+_ACK_PHRASES = ("One moment, sir.", "Right away, sir.", "Give me a moment, sir.",
+                "Working on it, sir.", "Let me think on that, sir.")
+
+
+def _ack_phrase() -> str:
+    """Instant spoken acknowledgement while the slow local brain thinks."""
+    import random
+    return random.choice(_ACK_PHRASES)
+
+
+def _local_brain_active() -> bool:
+    return anthropic_client is None or _anthropic_unavailable
+
+
+def _disable_anthropic():
+    """Drop the client after a credit/auth failure so background summaries and
+    memory extraction (all gated on `anthropic_client`) stop retrying Claude."""
+    global anthropic_client
+    anthropic_client = None
+
+
+async def _reprobe_claude_loop(every_s: int = 1800):
+    """While Claude is marked unavailable (no credits / auth), try one tiny call every
+    30 min; on success recreate the client so JARVIS returns to Claude without a restart."""
+    global anthropic_client, _anthropic_unavailable
+    while True:
+        await asyncio.sleep(every_s)
+        if not _anthropic_unavailable or not ANTHROPIC_API_KEY:
+            continue
+        try:
+            probe = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+            await probe.messages.create(model="claude-haiku-4-5-20251001", max_tokens=1,
+                                        messages=[{"role": "user", "content": "ok"}])
+            anthropic_client, _anthropic_unavailable = probe, False
+            log.info("Claude is available again — switching back from the local brain")
+        except Exception as e:
+            log.info(f"Claude still unavailable ({str(e)[:80]}) — staying on the local brain")
+
+
+async def _local_brain_reply(text: str, history: list[dict]) -> str:
+    """Free local reply via Ollama, run off the event loop (it blocks for seconds on CPU)."""
+    import ollama_fallback as _ollama
+    extra = f"Current time: {datetime.now().strftime('%A, %B %d, %Y at %I:%M %p')}."
+    cal = _ctx_cache.get("calendar")
+    if cal:
+        extra += f"\nCalendar: {str(cal)[:300]}"
+    if _ollama._MARKET_WORDS.search(text):
+        try:
+            from ai_advisers_bridge import get_latest_intelligence
+            extra += "\n" + get_latest_intelligence()
+        except Exception:
+            pass
+    return await asyncio.to_thread(_ollama.generate_simple, text, history, extra)
+
 async def _resume_mic_after(delay: float):
     """Resume mic listener after JARVIS finishes speaking."""
     await asyncio.sleep(delay)
@@ -2268,7 +2307,10 @@ async def generate_response(
     last_response: str = "",
     session_summary: str = "",
 ) -> str:
-    """Generate a JARVIS response using Anthropic API."""
+    """Generate a JARVIS response using Anthropic API (local Ollama brain when unavailable)."""
+    global _anthropic_unavailable
+    if client is None or _anthropic_unavailable:
+        return await _local_brain_reply(text, conversation_history[-6:])
     now = datetime.now()
     current_time = now.strftime("%A, %B %d, %Y at %I:%M %p")
 
@@ -2356,6 +2398,14 @@ async def generate_response(
         return ""
     except Exception as e:
         log.error(f"LLM error: {e}")
+        err_str = str(e).lower()
+        if any(k in err_str for k in ("credit balance", "too low", "invalid_api_key", "permission", "unauthorized", "402", "401")):
+            _anthropic_unavailable = True
+            _disable_anthropic()
+            log.warning("Anthropic API credit/auth issue — routing all LLM calls to Ollama this session.")
+        reply = await _local_brain_reply(text, conversation_history[-6:])
+        if reply:
+            return reply
         return "Apologies, sir. I'm having trouble connecting to my language systems."
 
 
@@ -2464,10 +2514,9 @@ async def generate_response_streamed(
     # ── If Anthropic is known-unavailable, go straight to Ollama ──
     if _anthropic_unavailable:
         try:
-            import ollama_fallback as _ollama
-            if _ollama.is_available():
-                full_text = _ollama.generate_simple(text, conversation_history[-6:])
-                if full_text:
+            await _flush_sentence(_ack_phrase())
+            full_text = await _local_brain_reply(text, conversation_history[-6:])
+            if full_text:
                     await _flush_sentence(full_text)
                     return full_text
         except Exception as _oe:
@@ -2519,19 +2568,19 @@ async def generate_response_streamed(
         # Mark Anthropic unavailable for this session on credit/auth errors
         if any(k in err_str for k in ("credit balance", "too low", "invalid_api_key", "permission", "unauthorized", "402", "401")):
             _anthropic_unavailable = True  # global declared at top of function
+            _disable_anthropic()
             log.warning("Anthropic API credit/auth issue — routing all LLM calls to Ollama this session.")
 
         if not full_text:
             # ── Tier 1: Ollama local models (in preference order) ──
             ollama_done = False
             try:
-                import ollama_fallback as _ollama
-                if _ollama.is_available():
-                    log.info("[ollama] falling back to local LLM")
-                    full_text = _ollama.generate_simple(text, conversation_history[-6:])
-                    if full_text:
-                        await _flush_sentence(full_text)
-                        ollama_done = True
+                log.info("[ollama] falling back to local LLM")
+                await _flush_sentence(_ack_phrase())
+                full_text = await _local_brain_reply(text, conversation_history[-6:])
+                if full_text:
+                    await _flush_sentence(full_text)
+                    ollama_done = True
             except Exception as _oe:
                 log.warning(f"Ollama fallback error: {_oe}")
 
@@ -2644,7 +2693,8 @@ def get_usage_summary() -> str:
 
 _INTERACTION_LOG = Path(__file__).parent / "data" / "interaction_log.jsonl"
 
-def _log_interaction(user_text: str, response_text: str, latency_ms: float = 0):
+def _log_interaction(user_text: str, response_text: str, latency_ms: float = 0,
+                     channel: str = "browser"):
     """Append one interaction to the log. Non-blocking — called from asyncio task."""
     try:
         _INTERACTION_LOG.parent.mkdir(exist_ok=True)
@@ -2653,6 +2703,8 @@ def _log_interaction(user_text: str, response_text: str, latency_ms: float = 0):
             "user": user_text[:300],
             "jarvis": response_text[:500],
             "latency_ms": round(latency_ms),
+            "channel": channel,
+            "brain": "local" if _local_brain_active() else "claude",
         }
         with open(_INTERACTION_LOG, "a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -3018,11 +3070,12 @@ return windowList
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global anthropic_client, cached_projects, _mic_listener
+    global anthropic_client, cached_projects, _mic_listener, _anthropic_unavailable
     if ANTHROPIC_API_KEY:
         anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
     else:
-        log.warning("ANTHROPIC_API_KEY not set — LLM features disabled")
+        _anthropic_unavailable = True
+        log.warning("ANTHROPIC_API_KEY not set — using the free local brain (Ollama)")
     cached_projects = []
 
     # Start context refresh in a separate thread (never touches event loop)
@@ -3033,9 +3086,15 @@ async def lifespan(application: FastAPI):
         loop = asyncio.get_event_loop()
         asyncio.run_coroutine_threadsafe(_transcript_queue.put(text), loop)
 
-    _mic_listener = MicListener(on_transcript=_on_transcript)
-    _mic_listener.start(asyncio.get_event_loop())
+    # The always-on wake-word daemon (com.jarvis.daemon) owns the mic by default;
+    # two Whisper listeners double the CPU and fight over the audio device.
+    if os.environ.get("JARVIS_SERVER_MIC", "1") != "0":
+        _mic_listener = MicListener(on_transcript=_on_transcript)
+        _mic_listener.start(asyncio.get_event_loop())
+    else:
+        log.info("Server mic listener off (JARVIS_SERVER_MIC=0) — wake-word daemon owns the mic")
 
+    asyncio.create_task(_reprobe_claude_loop())
     log.info("JARVIS server starting")
     yield
 
@@ -3245,7 +3304,7 @@ def detect_action_fast(text: str) -> dict | None:
 # -- Action Handlers -------------------------------------------------------
 
 async def handle_open_terminal() -> str:
-    result = await open_terminal("claude --dangerously-skip-permissions")
+    result = await open_terminal("claude")
     return result["confirmation"]
 
 
@@ -3266,7 +3325,7 @@ async def handle_build(target: str) -> str:
     script = (
         'tell application "Terminal"\n'
         "    activate\n"
-        f'    do script "cd {path} && cat .jarvis_prompt.txt | claude -p --dangerously-skip-permissions"\n'
+        f'    do script "cd {path} && cat .jarvis_prompt.txt | claude -p --permission-mode acceptEdits"\n'
         "end tell"
     )
     await asyncio.create_subprocess_exec(
@@ -4057,230 +4116,224 @@ async def voice_handler(ws: WebSocket):
                         else:
                             response_text = "Understood, sir."
                     else:
-                        if not anthropic_client:
-                            response_text = "API key not configured."
+                        # no key/credits → generate_response_streamed goes local
+                        # Check response cache first (common/repeatable queries)
+                        try:
+                            import response_cache as _rcache
+                            _cached = _rcache.get(user_text)
+                        except Exception:
+                            _cached = None
+                        if _cached:
+                            log.info("[cache] hit for: %s", user_text[:60])
+                            response_text = _cached
+                            _tts_already_sent = False
                         else:
-                            # Check response cache first (common/repeatable queries)
+                            # Streaming path — TTS starts on first sentence, not after full response
+                            await ws.send_json({"type": "status", "state": "thinking"})
                             try:
-                                import response_cache as _rcache
-                                _cached = _rcache.get(user_text)
-                            except Exception:
-                                _cached = None
-                            if _cached:
-                                log.info("[cache] hit for: %s", user_text[:60])
-                                response_text = _cached
-                                _tts_already_sent = False
-                            else:
-                                # Streaming path — TTS starts on first sentence, not after full response
-                                await ws.send_json({"type": "status", "state": "thinking"})
+                                response_text = await generate_response_streamed(
+                                    user_text, anthropic_client, task_manager,
+                                    cached_projects, history, ws,
+                                    last_response=last_jarvis_response,
+                                    session_summary=session_summary,
+                                )
+                                _tts_already_sent = True
+                            except Exception as _api_err:
+                                # Ollama offline fallback if Anthropic API fails
+                                log.warning(f"Anthropic API error, trying Ollama fallback: {_api_err}")
                                 try:
-                                    response_text = await generate_response_streamed(
-                                        user_text, anthropic_client, task_manager,
-                                        cached_projects, history, ws,
-                                        last_response=last_jarvis_response,
-                                        session_summary=session_summary,
-                                    )
-                                    _tts_already_sent = True
-                                except Exception as _api_err:
-                                    # Ollama offline fallback if Anthropic API fails
-                                    log.warning(f"Anthropic API error, trying Ollama fallback: {_api_err}")
-                                    try:
-                                        import ollama_fallback as _ollama
-                                        if _ollama.is_available():
-                                            response_text = _ollama.generate_simple(user_text, history[-6:])
-                                            log.info("[ollama] fallback response generated")
-                                        else:
-                                            response_text = "I'm having trouble reaching my servers, sir. Please check your connection."
-                                    except Exception:
-                                        response_text = "API unavailable, sir."
-                                    _tts_already_sent = False
-                                # Store cacheable responses
-                                try:
-                                    _rcache.set(user_text, response_text)
+                                    response_text = await _local_brain_reply(user_text, history[-6:])
+                                    log.info("[ollama] fallback response generated")
                                 except Exception:
+                                    response_text = "API unavailable, sir."
+                                _tts_already_sent = False
+                            # Store cacheable responses
+                            try:
+                                _rcache.set(user_text, response_text)
+                            except Exception:
+                                pass
+
+                        # Check for action tags embedded in LLM response
+                        clean_response, embedded_action = extract_action(response_text)
+                        if embedded_action:
+                            log.info(f"LLM embedded action: {embedded_action}")
+                            response_text = clean_response
+                            # Ensure there's always something to speak
+                            if not response_text.strip():
+                                action_type = embedded_action["action"]
+                                if action_type == "prompt_project":
+                                    proj = embedded_action["target"].split("|||")[0].strip()
+                                    response_text = f"Connecting to {proj} now, sir."
+                                elif action_type == "build":
+                                    response_text = "On it, sir."
+                                elif action_type == "research":
+                                    response_text = "Looking into that now, sir."
+                                else:
+                                    response_text = "Right away, sir."
+
+                            if embedded_action["action"] == "build":
+                                # Build in background — JARVIS stays conversational
+                                target = embedded_action["target"]
+                                name = _generate_project_name(target)
+                                path = str(Path.home() / "Desktop" / name)
+                                os.makedirs(path, exist_ok=True)
+
+                                # Write detailed CLAUDE.md
+                                Path(path, "CLAUDE.md").write_text(
+                                    f"# Task\n\n{target}\n\n"
+                                    "## Instructions\n"
+                                    "- BUILD THIS NOW. Do not ask clarifying questions.\n"
+                                    "- Use your best judgment for any design/architecture decisions.\n"
+                                    "- Write complete, working code files — not plans or specs.\n"
+                                    "- If it's a web app: use React + Vite + Tailwind unless specified otherwise.\n"
+                                    "- Make it look polished and professional. Modern UI, clean layout.\n"
+                                    "- Ensure it runs with a single command (npm run dev or similar).\n"
+                                    "- If you reference a real product's UI (e.g. 'Zillow clone'), match their actual layout and features closely.\n"
+                                    "- Use realistic mock data, not placeholder Lorem Ipsum.\n"
+                                    "- After building, start the dev server and verify the app loads without errors.\n"
+                                    "- IMPORTANT: Your LAST line of output MUST be exactly: RUNNING_AT=http://localhost:PORT (the actual port the dev server is using)\n"
+                                )
+
+                                # Register and dispatch
+                                did = dispatch_registry.register(name, path, target)
+                                asyncio.create_task(
+                                    _execute_prompt_project(name, target, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state)
+                                )
+                            elif embedded_action["action"] == "browse":
+                                asyncio.create_task(_execute_browse(embedded_action["target"]))
+                            elif embedded_action["action"] == "research":
+                                # Research enters work mode too
+                                name = _generate_project_name(embedded_action["target"])
+                                path = str(Path.home() / "Desktop" / name)
+                                os.makedirs(path, exist_ok=True)
+                                await work_session.start(path)
+                                asyncio.create_task(
+                                    self_work_and_notify(work_session, embedded_action["target"], ws)
+                                )
+                            elif embedded_action["action"] == "open_terminal":
+                                asyncio.create_task(_execute_open_terminal())
+                            elif embedded_action["action"] == "prompt_project":
+                                target = embedded_action["target"]
+                                if "|||" in target:
+                                    proj_name, _, prompt = target.partition("|||")
+                                    proj_name = proj_name.strip()
+                                    prompt = prompt.strip()
+                                    # Check for recent completed dispatch before re-dispatching
+                                    recent = dispatch_registry.get_recent_for_project(proj_name)
+                                    if recent and recent.get("summary"):
+                                        log.info(f"Using recent dispatch result for {proj_name} instead of re-dispatching")
+                                        response_text = recent["summary"]
+                                        history.append({"role": "assistant", "content": f"[Previous dispatch result for {proj_name}]: {recent['summary']}"})
+                                    else:
+                                        asyncio.create_task(
+                                            _execute_prompt_project(proj_name, prompt, work_session, ws, history=history, voice_state=voice_state)
+                                        )
+                                else:
+                                    log.warning(f"PROMPT_PROJECT missing ||| delimiter: {target}")
+                            elif embedded_action["action"] == "add_task":
+                                target = embedded_action["target"]
+                                parts = target.split("|||")
+                                if len(parts) >= 2:
+                                    priority = parts[0].strip() or "medium"
+                                    title = parts[1].strip()
+                                    desc = parts[2].strip() if len(parts) > 2 else ""
+                                    due = parts[3].strip() if len(parts) > 3 else ""
+                                    create_task(title=title, description=desc, priority=priority, due_date=due)
+                                    log.info(f"Task created: {title}")
+                            elif embedded_action["action"] == "add_note":
+                                target = embedded_action["target"]
+                                if "|||" in target:
+                                    topic, _, content = target.partition("|||")
+                                    create_note(content=content.strip(), topic=topic.strip())
+                                else:
+                                    create_note(content=target)
+                                log.info(f"Note created")
+                            elif embedded_action["action"] == "complete_task":
+                                try:
+                                    task_id = int(embedded_action["target"].strip())
+                                    complete_task(task_id)
+                                    log.info(f"Task {task_id} completed")
+                                except ValueError:
                                     pass
-
-                            # Check for action tags embedded in LLM response
-                            clean_response, embedded_action = extract_action(response_text)
-                            if embedded_action:
-                                log.info(f"LLM embedded action: {embedded_action}")
-                                response_text = clean_response
-                                # Ensure there's always something to speak
-                                if not response_text.strip():
-                                    action_type = embedded_action["action"]
-                                    if action_type == "prompt_project":
-                                        proj = embedded_action["target"].split("|||")[0].strip()
-                                        response_text = f"Connecting to {proj} now, sir."
-                                    elif action_type == "build":
-                                        response_text = "On it, sir."
-                                    elif action_type == "research":
-                                        response_text = "Looking into that now, sir."
+                            elif embedded_action["action"] == "remember":
+                                remember(embedded_action["target"].strip(), mem_type="fact", importance=7)
+                                log.info(f"Memory stored: {embedded_action['target'][:60]}")
+                            elif embedded_action["action"] == "create_note":
+                                target = embedded_action["target"]
+                                if "|||" in target:
+                                    title, _, body = target.partition("|||")
+                                    asyncio.create_task(create_apple_note(title.strip(), body.strip()))
+                                    log.info(f"Apple Note created: {title.strip()}")
+                                else:
+                                    asyncio.create_task(create_apple_note("JARVIS Note", target))
+                            elif embedded_action["action"] == "screen":
+                                asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
+                            elif embedded_action["action"] == "create_event":
+                                asyncio.create_task(_execute_create_event(embedded_action["target"], ws, history))
+                            elif embedded_action["action"] == "github":
+                                asyncio.create_task(_execute_github(embedded_action["target"], ws, history, voice_state))
+                            elif embedded_action["action"] == "reminder":
+                                asyncio.create_task(_execute_reminder(embedded_action["target"], ws))
+                            elif embedded_action["action"] == "complete_reminder":
+                                asyncio.create_task(_execute_complete_reminder(embedded_action["target"], ws))
+                            elif embedded_action["action"] == "contact":
+                                asyncio.create_task(_execute_contact_lookup(embedded_action["target"], ws, history, voice_state))
+                            elif embedded_action["action"] == "spotify":
+                                asyncio.create_task(_execute_spotify(embedded_action["target"], ws, history, voice_state))
+                            elif embedded_action["action"] == "clipboard_read":
+                                asyncio.create_task(_lookup_and_report("clipboard", _do_clipboard_read, ws, history=history, voice_state=voice_state))
+                            elif embedded_action["action"] == "clipboard_write":
+                                asyncio.create_task(_execute_clipboard_write(embedded_action["target"], ws))
+                            elif embedded_action["action"] == "market":
+                                asyncio.create_task(_execute_market_price(embedded_action["target"], ws, history, voice_state))
+                            elif embedded_action["action"] == "market_summary":
+                                asyncio.create_task(_lookup_and_report("market", _do_market_summary_lookup, ws, history=history, voice_state=voice_state))
+                            elif embedded_action["action"] == "add_holding":
+                                asyncio.create_task(_execute_portfolio_add(embedded_action["target"], ws, history, voice_state))
+                            elif embedded_action["action"] == "remove_holding":
+                                asyncio.create_task(_execute_portfolio_remove(embedded_action["target"], ws, history, voice_state))
+                            elif embedded_action["action"] == "portfolio_status":
+                                asyncio.create_task(_execute_portfolio_status(ws, history, voice_state))
+                            elif embedded_action["action"] == "home_light":
+                                asyncio.create_task(_execute_home_light(embedded_action["target"], ws, history))
+                            elif embedded_action["action"] == "home_temp":
+                                asyncio.create_task(_execute_home_temp(embedded_action["target"], ws, history))
+                            elif embedded_action["action"] == "home_scene":
+                                asyncio.create_task(_execute_home_scene(embedded_action["target"], ws, history))
+                            elif embedded_action["action"] in ("sys_volume", "sys_brightness", "sys_mute",
+                                                                "sys_unmute", "sys_launch", "sys_quit",
+                                                                "sys_stats", "sys_lock", "sys_battery",
+                                                                "sys_wifi", "send_imessage"):
+                                asyncio.create_task(_execute_system_action(
+                                    embedded_action["action"], embedded_action.get("target", ""), ws, history))
+                            elif embedded_action["action"] == "websearch":
+                                asyncio.create_task(_execute_websearch(embedded_action.get("target", ""), ws, history))
+                            elif embedded_action["action"] == "query_kb":
+                                asyncio.create_task(_execute_query_kb(embedded_action.get("target", ""), ws, history))
+                            elif embedded_action["action"] == "set_trigger":
+                                asyncio.create_task(_execute_set_trigger(embedded_action.get("target", ""), ws, history))
+                            elif embedded_action["action"] == "read_doc":
+                                asyncio.create_task(_execute_read_doc(embedded_action.get("target", ""), ws, history))
+                            elif embedded_action["action"] == "send_email":
+                                asyncio.create_task(_execute_send_email(embedded_action.get("target", ""), ws, history))
+                            elif embedded_action["action"] == "pegasus":
+                                asyncio.create_task(_execute_pegasus(embedded_action.get("target", "CODE_BLACK"), ws, history))
+                            elif embedded_action["action"] == "read_note":
+                                # Read note in background and report back
+                                async def _read_and_report(search_term, _ws):
+                                    note = await read_note(search_term)
+                                    if note:
+                                        msg = f"Sir, your note '{note['title']}' says: {note['body'][:200]}"
                                     else:
-                                        response_text = "Right away, sir."
-
-                                if embedded_action["action"] == "build":
-                                    # Build in background — JARVIS stays conversational
-                                    target = embedded_action["target"]
-                                    name = _generate_project_name(target)
-                                    path = str(Path.home() / "Desktop" / name)
-                                    os.makedirs(path, exist_ok=True)
-
-                                    # Write detailed CLAUDE.md
-                                    Path(path, "CLAUDE.md").write_text(
-                                        f"# Task\n\n{target}\n\n"
-                                        "## Instructions\n"
-                                        "- BUILD THIS NOW. Do not ask clarifying questions.\n"
-                                        "- Use your best judgment for any design/architecture decisions.\n"
-                                        "- Write complete, working code files — not plans or specs.\n"
-                                        "- If it's a web app: use React + Vite + Tailwind unless specified otherwise.\n"
-                                        "- Make it look polished and professional. Modern UI, clean layout.\n"
-                                        "- Ensure it runs with a single command (npm run dev or similar).\n"
-                                        "- If you reference a real product's UI (e.g. 'Zillow clone'), match their actual layout and features closely.\n"
-                                        "- Use realistic mock data, not placeholder Lorem Ipsum.\n"
-                                        "- After building, start the dev server and verify the app loads without errors.\n"
-                                        "- IMPORTANT: Your LAST line of output MUST be exactly: RUNNING_AT=http://localhost:PORT (the actual port the dev server is using)\n"
-                                    )
-
-                                    # Register and dispatch
-                                    did = dispatch_registry.register(name, path, target)
-                                    asyncio.create_task(
-                                        _execute_prompt_project(name, target, work_session, ws, dispatch_id=did, history=history, voice_state=voice_state)
-                                    )
-                                elif embedded_action["action"] == "browse":
-                                    asyncio.create_task(_execute_browse(embedded_action["target"]))
-                                elif embedded_action["action"] == "research":
-                                    # Research enters work mode too
-                                    name = _generate_project_name(embedded_action["target"])
-                                    path = str(Path.home() / "Desktop" / name)
-                                    os.makedirs(path, exist_ok=True)
-                                    await work_session.start(path)
-                                    asyncio.create_task(
-                                        self_work_and_notify(work_session, embedded_action["target"], ws)
-                                    )
-                                elif embedded_action["action"] == "open_terminal":
-                                    asyncio.create_task(_execute_open_terminal())
-                                elif embedded_action["action"] == "prompt_project":
-                                    target = embedded_action["target"]
-                                    if "|||" in target:
-                                        proj_name, _, prompt = target.partition("|||")
-                                        proj_name = proj_name.strip()
-                                        prompt = prompt.strip()
-                                        # Check for recent completed dispatch before re-dispatching
-                                        recent = dispatch_registry.get_recent_for_project(proj_name)
-                                        if recent and recent.get("summary"):
-                                            log.info(f"Using recent dispatch result for {proj_name} instead of re-dispatching")
-                                            response_text = recent["summary"]
-                                            history.append({"role": "assistant", "content": f"[Previous dispatch result for {proj_name}]: {recent['summary']}"})
-                                        else:
-                                            asyncio.create_task(
-                                                _execute_prompt_project(proj_name, prompt, work_session, ws, history=history, voice_state=voice_state)
-                                            )
-                                    else:
-                                        log.warning(f"PROMPT_PROJECT missing ||| delimiter: {target}")
-                                elif embedded_action["action"] == "add_task":
-                                    target = embedded_action["target"]
-                                    parts = target.split("|||")
-                                    if len(parts) >= 2:
-                                        priority = parts[0].strip() or "medium"
-                                        title = parts[1].strip()
-                                        desc = parts[2].strip() if len(parts) > 2 else ""
-                                        due = parts[3].strip() if len(parts) > 3 else ""
-                                        create_task(title=title, description=desc, priority=priority, due_date=due)
-                                        log.info(f"Task created: {title}")
-                                elif embedded_action["action"] == "add_note":
-                                    target = embedded_action["target"]
-                                    if "|||" in target:
-                                        topic, _, content = target.partition("|||")
-                                        create_note(content=content.strip(), topic=topic.strip())
-                                    else:
-                                        create_note(content=target)
-                                    log.info(f"Note created")
-                                elif embedded_action["action"] == "complete_task":
-                                    try:
-                                        task_id = int(embedded_action["target"].strip())
-                                        complete_task(task_id)
-                                        log.info(f"Task {task_id} completed")
-                                    except ValueError:
-                                        pass
-                                elif embedded_action["action"] == "remember":
-                                    remember(embedded_action["target"].strip(), mem_type="fact", importance=7)
-                                    log.info(f"Memory stored: {embedded_action['target'][:60]}")
-                                elif embedded_action["action"] == "create_note":
-                                    target = embedded_action["target"]
-                                    if "|||" in target:
-                                        title, _, body = target.partition("|||")
-                                        asyncio.create_task(create_apple_note(title.strip(), body.strip()))
-                                        log.info(f"Apple Note created: {title.strip()}")
-                                    else:
-                                        asyncio.create_task(create_apple_note("JARVIS Note", target))
-                                elif embedded_action["action"] == "screen":
-                                    asyncio.create_task(_lookup_and_report("screen", _do_screen_lookup, ws, history=history, voice_state=voice_state))
-                                elif embedded_action["action"] == "create_event":
-                                    asyncio.create_task(_execute_create_event(embedded_action["target"], ws, history))
-                                elif embedded_action["action"] == "github":
-                                    asyncio.create_task(_execute_github(embedded_action["target"], ws, history, voice_state))
-                                elif embedded_action["action"] == "reminder":
-                                    asyncio.create_task(_execute_reminder(embedded_action["target"], ws))
-                                elif embedded_action["action"] == "complete_reminder":
-                                    asyncio.create_task(_execute_complete_reminder(embedded_action["target"], ws))
-                                elif embedded_action["action"] == "contact":
-                                    asyncio.create_task(_execute_contact_lookup(embedded_action["target"], ws, history, voice_state))
-                                elif embedded_action["action"] == "spotify":
-                                    asyncio.create_task(_execute_spotify(embedded_action["target"], ws, history, voice_state))
-                                elif embedded_action["action"] == "clipboard_read":
-                                    asyncio.create_task(_lookup_and_report("clipboard", _do_clipboard_read, ws, history=history, voice_state=voice_state))
-                                elif embedded_action["action"] == "clipboard_write":
-                                    asyncio.create_task(_execute_clipboard_write(embedded_action["target"], ws))
-                                elif embedded_action["action"] == "market":
-                                    asyncio.create_task(_execute_market_price(embedded_action["target"], ws, history, voice_state))
-                                elif embedded_action["action"] == "market_summary":
-                                    asyncio.create_task(_lookup_and_report("market", _do_market_summary_lookup, ws, history=history, voice_state=voice_state))
-                                elif embedded_action["action"] == "add_holding":
-                                    asyncio.create_task(_execute_portfolio_add(embedded_action["target"], ws, history, voice_state))
-                                elif embedded_action["action"] == "remove_holding":
-                                    asyncio.create_task(_execute_portfolio_remove(embedded_action["target"], ws, history, voice_state))
-                                elif embedded_action["action"] == "portfolio_status":
-                                    asyncio.create_task(_execute_portfolio_status(ws, history, voice_state))
-                                elif embedded_action["action"] == "home_light":
-                                    asyncio.create_task(_execute_home_light(embedded_action["target"], ws, history))
-                                elif embedded_action["action"] == "home_temp":
-                                    asyncio.create_task(_execute_home_temp(embedded_action["target"], ws, history))
-                                elif embedded_action["action"] == "home_scene":
-                                    asyncio.create_task(_execute_home_scene(embedded_action["target"], ws, history))
-                                elif embedded_action["action"] in ("sys_volume", "sys_brightness", "sys_mute",
-                                                                    "sys_unmute", "sys_launch", "sys_quit",
-                                                                    "sys_stats", "sys_lock", "sys_battery",
-                                                                    "sys_wifi", "send_imessage"):
-                                    asyncio.create_task(_execute_system_action(
-                                        embedded_action["action"], embedded_action.get("target", ""), ws, history))
-                                elif embedded_action["action"] == "websearch":
-                                    asyncio.create_task(_execute_websearch(embedded_action.get("target", ""), ws, history))
-                                elif embedded_action["action"] == "query_kb":
-                                    asyncio.create_task(_execute_query_kb(embedded_action.get("target", ""), ws, history))
-                                elif embedded_action["action"] == "set_trigger":
-                                    asyncio.create_task(_execute_set_trigger(embedded_action.get("target", ""), ws, history))
-                                elif embedded_action["action"] == "read_doc":
-                                    asyncio.create_task(_execute_read_doc(embedded_action.get("target", ""), ws, history))
-                                elif embedded_action["action"] == "send_email":
-                                    asyncio.create_task(_execute_send_email(embedded_action.get("target", ""), ws, history))
-                                elif embedded_action["action"] == "pegasus":
-                                    asyncio.create_task(_execute_pegasus(embedded_action.get("target", "CODE_BLACK"), ws, history))
-                                elif embedded_action["action"] == "read_note":
-                                    # Read note in background and report back
-                                    async def _read_and_report(search_term, _ws):
-                                        note = await read_note(search_term)
-                                        if note:
-                                            msg = f"Sir, your note '{note['title']}' says: {note['body'][:200]}"
-                                        else:
-                                            msg = f"Couldn't find a note matching '{search_term}', sir."
-                                        audio = await synthesize_speech(strip_markdown_for_tts(msg))
-                                        if audio and _ws:
-                                            try:
-                                                await _ws.send_json({"type": "status", "state": "speaking"})
-                                                await _ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
-                                            except Exception:
-                                                pass
-                                    asyncio.create_task(_read_and_report(embedded_action["target"].strip(), ws))
+                                        msg = f"Couldn't find a note matching '{search_term}', sir."
+                                    audio = await synthesize_speech(strip_markdown_for_tts(msg))
+                                    if audio and _ws:
+                                        try:
+                                            await _ws.send_json({"type": "status", "state": "speaking"})
+                                            await _ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+                                        except Exception:
+                                            pass
+                                asyncio.create_task(_read_and_report(embedded_action["target"].strip(), ws))
 
                 # Update history
                 history.append({"role": "user", "content": user_text})
@@ -4544,6 +4597,7 @@ async def api_save_preferences(body: PreferencesUpdate):
 
 # Track active WS client count for notification_bridge
 _ws_client_count = 0
+_headless_history: list[dict] = []  # daemon conversations when no browser is open
 
 @app.post("/api/transcript")
 async def api_transcript(request: Request):
@@ -4555,9 +4609,35 @@ async def api_transcript(request: Request):
         if not text:
             return {"error": "empty transcript"}
         log.info(f"[daemon] transcript: {text}")
-        # Put into the shared transcript queue so the active WS session processes it
-        await _transcript_queue.put(text)
-        return {"status": "queued"}
+        if _ws_client_count > 0:
+            # Put into the shared transcript queue so the active WS session processes it
+            await _transcript_queue.put(text)
+            return {"status": "queued"}
+
+        # Headless (no browser open): answer here and hand the daemon audio to play
+        t0 = time.time()
+        if _local_brain_active():
+            try:
+                from local_tts import speak as _speak
+                _speak(_ack_phrase())  # non-blocking; the daemon is waiting on us, not listening
+            except Exception:
+                pass
+        reply = await generate_response(text, anthropic_client, task_manager, cached_projects,
+                                        _headless_history[-10:], last_response="")
+        reply, _action = extract_action(reply)
+        reply = reply.strip() or "Understood, sir."
+        _headless_history.extend([{"role": "user", "content": text},
+                                  {"role": "assistant", "content": reply}])
+        del _headless_history[:-20]
+        log.info(f"[daemon] reply: {reply[:120]}")
+        _log_interaction(text, reply, latency_ms=(time.time() - t0) * 1000, channel="daemon")
+        audio = await synthesize_speech(strip_markdown_for_tts(reply))
+        if not audio:
+            return {"status": "answered", "text": reply}
+        ext = ".wav" if audio[:4] == b"RIFF" else ".mp3"
+        path = Path(tempfile.gettempdir()) / f"jarvis_headless_reply{ext}"
+        path.write_bytes(audio)
+        return {"status": "answered", "text": reply, "audio_path": str(path)}
     except Exception as e:
         log.error(f"api_transcript error: {e}")
         return {"error": str(e)}
@@ -4575,9 +4655,12 @@ async def api_siri(request: Request):
             return {"response": "No input received, sir."}
         log.info(f"[siri] query: {text}")
         # Use generate_response directly (no streaming for Siri)
-        if not anthropic_client:
-            return {"response": "API key not configured."}
-        response = await generate_response(text, anthropic_client, task_manager, cached_projects, [], last_response="")
+        t0 = time.time()
+        if not anthropic_client or _anthropic_unavailable:
+            response = await _local_brain_reply(text, [])
+        else:
+            response = await generate_response(text, anthropic_client, task_manager, cached_projects, [], last_response="")
+        _log_interaction(text, response, latency_ms=(time.time() - t0) * 1000, channel="siri")
         return {"response": response, "text": response}
     except Exception as e:
         log.error(f"api_siri error: {e}")
@@ -4651,7 +4734,7 @@ async def api_fix_self():
     script = (
         'tell application "Terminal"\n'
         '    activate\n'
-        f'    do script "cd {jarvis_dir} && claude --dangerously-skip-permissions"\n'
+        f'    do script "cd {jarvis_dir} && claude"\n'
         'end tell'
     )
     await asyncio.create_subprocess_exec(
