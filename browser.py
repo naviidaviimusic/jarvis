@@ -7,6 +7,7 @@ Runs headless Chromium with realistic user agent to avoid blocking.
 
 import asyncio
 import logging
+import os
 import tempfile
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -203,8 +204,8 @@ class JarvisBrowser:
             await page.wait_for_timeout(1000)  # let rendering settle
 
             if not path:
-                tmp = tempfile.mktemp(suffix=".png", prefix="jarvis_screenshot_")
-                path = tmp
+                fd, path = tempfile.mkstemp(suffix=".png", prefix="jarvis_screenshot_")
+                os.close(fd)
 
             await page.screenshot(path=path, full_page=True)
             log.info(f"Screenshot saved: {path}")

@@ -25,6 +25,7 @@ sys.modules["torch"] = None
 import numpy as np
 import pyaudio
 import requests
+from requests.adapters import HTTPAdapter
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # localhost self-signed cert
@@ -54,6 +55,7 @@ MAX_RECORD_CHUNKS = int(MAX_RECORD_S * RATE / CHUNK)  # stops music/noise runawa
 
 # ─── Behaviour ────────────────────────────────────────────────────────────────
 SERVER_URL = os.environ.get("JARVIS_SERVER_URL", "https://localhost:8340/api/transcript")
+SERVER_CERT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cert.pem")
 POST_TIMEOUT_S = 120            # headless replies come from the local CPU brain
 POST_RETRIES = 3
 POST_RETRY_DELAY_S = 1.0
@@ -123,11 +125,23 @@ def extract_command(transcript: str) -> str | None:
 
 
 # ─── Server POST ──────────────────────────────────────────────────────────────
+class _LocalCertAdapter(HTTPAdapter):
+    """Trust only JARVIS's own certificate; it predates hostname entries, so skip that one check."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["assert_hostname"] = False
+        return super().init_poolmanager(*args, **kwargs)
+
+
+_server_session = requests.Session()
+_server_session.mount("https://localhost:", _LocalCertAdapter())
+
+
 def post_transcript(text: str) -> dict | None:
     payload = {"text": text, "source": "daemon"}
     for attempt in range(1, POST_RETRIES + 1):
         try:
-            resp = requests.post(SERVER_URL, json=payload, timeout=POST_TIMEOUT_S, verify=False)
+            resp = _server_session.post(SERVER_URL, json=payload, timeout=POST_TIMEOUT_S, verify=SERVER_CERT)
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.ReadTimeout:
