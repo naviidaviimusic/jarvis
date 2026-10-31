@@ -107,7 +107,8 @@ async def test_browser_visit_invalid_url(browser):
 @pytest.mark.skipif(not NETWORK_AVAILABLE, reason=SKIP_REASON)
 async def test_browser_screenshot(browser):
     """Screenshot produces a valid PNG file."""
-    tmp_path = tempfile.mktemp(suffix=".png", prefix="jarvis_test_ss_")
+    fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="jarvis_test_ss_")
+    os.close(fd)
 
     try:
         result_path = await browser.screenshot("https://example.com", path=tmp_path)
