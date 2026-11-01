@@ -64,10 +64,13 @@ function addToHistory(role: string, content: string) {
 
   const entry = document.createElement("div");
   entry.className = `history-entry ${role}`;
-  entry.innerHTML = `
-    <div class="history-role">${role === "user" ? "YOU" : "JARVIS"}</div>
-    <div class="history-content">${content.substring(0, 300)}${content.length > 300 ? "…" : ""}</div>
-  `;
+  const roleEl = document.createElement("div");
+  roleEl.className = "history-role";
+  roleEl.textContent = role === "user" ? "YOU" : "JARVIS";
+  const contentEl = document.createElement("div");
+  contentEl.className = "history-content";
+  contentEl.textContent = content.substring(0, 300) + (content.length > 300 ? "…" : "");
+  entry.append(roleEl, contentEl);
   historyList.appendChild(entry);
   historyList.scrollTop = historyList.scrollHeight;
 }
