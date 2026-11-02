@@ -66,7 +66,7 @@ def _read_docx(path: str) -> str:
     # XML fallback: unzip .docx and parse word/document.xml
     try:
         import zipfile
-        import xml.etree.ElementTree as ET
+        import defusedxml.ElementTree as ET
         with zipfile.ZipFile(path) as z:
             with z.open("word/document.xml") as f:
                 tree = ET.parse(f)
