@@ -220,7 +220,7 @@ def _generate_raw(prompt: str, system: str = "", max_tokens: int = 200,
 # screening, shared notes in memory/mesh.db, secret redaction, tamper-evident audit.
 # Voice skips the shared notes and the council — on this CPU-only Mac they add seconds.
 # Every step is best-effort: a gateway problem never costs JARVIS a reply.
-AI_ADVISERS = os.path.expanduser("~/Documents/AI-Advisers")
+AI_ADVISERS = os.path.expanduser("~/AI-Advisers")
 _gw = None
 
 

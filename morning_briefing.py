@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-ADVISERS_MEM = (Path.home() / "Documents/AI-Advisers/memory")
+ADVISERS_MEM = (Path.home() / "AI-Advisers/memory")
 DATA_DIR = Path(__file__).parent / "data"
 BRIEFING_FILE = DATA_DIR / "morning_briefing.txt"
 MAX_AGE_HOURS = 12

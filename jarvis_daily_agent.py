@@ -32,7 +32,7 @@ log = logging.getLogger("jarvis_agent")
 
 JARVIS_DIR     = Path(__file__).parent
 REPORTS_DIR    = JARVIS_DIR / "reports"
-AI_ADV_MEMORY  = (Path.home() / "Documents/AI-Advisers/memory")
+AI_ADV_MEMORY  = (Path.home() / "AI-Advisers/memory")
 REPORTS_DIR.mkdir(exist_ok=True)
 
 ANTHROPIC_KEY = None

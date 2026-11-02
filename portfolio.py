@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 DB_PATH     = Path(__file__).parent / "data" / "portfolio.db"
-AI_ADVISERS = (Path.home() / "Documents/AI-Advisers/memory")
+AI_ADVISERS = (Path.home() / "AI-Advisers/memory")
 
 
 def _init_db():

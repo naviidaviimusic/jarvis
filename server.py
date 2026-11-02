@@ -399,7 +399,7 @@ async def fetch_weather() -> str:
 # AI Advisers Market Intelligence
 # ---------------------------------------------------------------------------
 
-AI_ADVISERS_MEMORY = (Path.home() / "Documents/AI-Advisers/memory")
+AI_ADVISERS_MEMORY = (Path.home() / "AI-Advisers/memory")
 
 _market_intel_cache: Optional[str] = None
 _market_intel_ts: float = 0
@@ -1948,7 +1948,7 @@ async def _execute_pegasus(level: str, ws, history: list | None = None):
             pass
     # Fire the protocol in background — it runs for several minutes
     import subprocess as _sp
-    pegasus_script = (Path.home() / "Documents/AI-Advisers/pegasus_protocol.py")
+    pegasus_script = (Path.home() / "AI-Advisers/pegasus_protocol.py")
     if pegasus_script.exists():
         _sp.Popen(
             ["/usr/local/bin/python3.11", str(pegasus_script), "--auto", level],
@@ -2734,7 +2734,7 @@ def _load_kb_intel() -> str:
     if _KB_CACHE and (now - _KB_CACHE_TIME) < _KB_CACHE_TTL:
         return _KB_CACHE
 
-    kb_path = (Path.home() / "Documents/AI-Advisers/memory/knowledge_base.db")
+    kb_path = (Path.home() / "AI-Advisers/memory/knowledge_base.db")
     if not kb_path.exists():
         return ""
     try:
@@ -2766,7 +2766,7 @@ def _load_kb_intel() -> str:
 _proactive_sent: dict = {}  # cooldown tracker: key → last_sent_ts
 _event_bus_seen: set = set()   # event IDs already surfaced to user
 
-_EVENT_BUS_DB = (Path.home() / "Documents/AI-Advisers/.security/event_bus.db")
+_EVENT_BUS_DB = (Path.home() / "AI-Advisers/.security/event_bus.db")
 
 # Human-readable messages for each event type
 _EVENT_MESSAGES = {
@@ -2854,7 +2854,7 @@ async def _proactive_loop(ws, history: list):
             # ── High conviction signal (file fallback if no event) ──
             if not alerts:
                 try:
-                    syn_path = (Path.home() / "Documents/AI-Advisers/memory/synthesis_report.json")
+                    syn_path = (Path.home() / "AI-Advisers/memory/synthesis_report.json")
                     if syn_path.exists():
                         syn = json.loads(syn_path.read_text())
                         pct = syn.get("conviction_pct", 0)

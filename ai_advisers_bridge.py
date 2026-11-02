@@ -19,7 +19,7 @@ from typing import Optional
 
 log = logging.getLogger("jarvis.kb")
 
-KB_PATH = (Path.home() / "Documents/AI-Advisers/memory/knowledge_base.db")
+KB_PATH = (Path.home() / "AI-Advisers/memory/knowledge_base.db")
 _CACHE_TTL = 120  # 2-minute cache for search results
 _cache: dict[str, tuple[float, str]] = {}
 
